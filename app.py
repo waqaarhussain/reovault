@@ -18,6 +18,7 @@ from starlette.concurrency import run_in_threadpool
 from core import Store, Engine, password_hash
 from device import discover
 from exporter import Exports
+from playback_preview import PlaybackPreviews
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get('REOVAULT_CONFIG', '/etc/reovault/config.json'))
@@ -25,6 +26,7 @@ SETTINGS = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 STORE = Store(os.environ.get('REOVAULT_DATA', '/var/lib/reovault'))
 ENGINE = Engine(STORE)
 EXPORTS = Exports(STORE)
+PREVIEWS = PlaybackPreviews(STORE)
 FAILURES = defaultdict(list)
 
 
@@ -175,7 +177,6 @@ def clean_camera(body, existing=None):
         port = int(body.get('port', existing.get('port', 554)))
     except (ValueError, TypeError):
         raise HTTPException(400, 'Port must be a number')
-    if not name and onvif_port:name='Camera awaiting device name'
     if not name or len(name)>60:
         raise HTTPException(400, 'Enter a camera name, up to 60 characters.')
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', host):
@@ -197,45 +198,31 @@ def uuid_hex():
     return secrets.token_hex(8)
 
 
-@app.post('/api/camera-name')
-async def camera_name(request:Request):
-    body=await small_json(request)
-    old=STORE.camera(str(body.get('id',''))) or {}
-    c=clean_camera(body,old)
-    try:return await run_in_threadpool(discover,c)
-    except Exception:raise HTTPException(400,'Cannot read the camera name. Check the forwarded ONVIF port and device credentials.')
+async def camera_clock(camera):
+    if not camera['onvif_port']:return None
+    try:return (await run_in_threadpool(discover,camera))['clock_offset']
+    except Exception:return None
 
 
 @app.post('/api/cameras')
 async def add_camera(request:Request):
     c=clean_camera(await small_json(request))
-    device=None
-    if c['onvif_port']:
-        try:
-            device=await run_in_threadpool(discover,c)
-            if c['name']=='Camera awaiting device name':c['name']=device['name']
-        except Exception:raise HTTPException(400,'Cannot read the camera name. Check its ONVIF port, or enter a manual name and leave ONVIF blank.')
+    offset=await camera_clock(c)
     STORE.execute('INSERT INTO cameras(id,name,host,port,username,password,path,enabled,compatible,onvif_port) VALUES(?,?,?,?,?,?,?,?,?,?)',tuple(c.values()))
-    if device:STORE.execute('UPDATE cameras SET device_name=?,clock_offset=? WHERE id=?',(device['name'],device['clock_offset'],c['id']))
+    STORE.execute('UPDATE cameras SET clock_offset=? WHERE id=?',(offset,c['id']))
     return {'ok':True,'id':c['id'],'record_enabled':False}
 
 
 @app.put('/api/cameras/{cid}')
-async def edit_camera(cid: str, request: Request):
-    old = STORE.camera(cid)
-    if not old or old['deleted']:
-        raise HTTPException(404)
-    c = clean_camera(await small_json(request), old)
-    if c['onvif_port']:
-        try:
-            device=await run_in_threadpool(discover,c)
-            if c['name']=='Camera awaiting device name':c['name']=device['name']
-            STORE.execute('UPDATE cameras SET device_name=?,clock_offset=? WHERE id=?',(device['name'],device['clock_offset'],cid))
-        except Exception:raise HTTPException(400,'Cannot read the camera name. Check its ONVIF port, or leave it blank to use a manual name.')
-    if not c['onvif_port']:STORE.execute('UPDATE cameras SET device_name=NULL,clock_offset=NULL WHERE id=?',(cid,))
+async def edit_camera(cid:str,request:Request):
+    old=STORE.camera(cid)
+    if not old or old['deleted']:raise HTTPException(404)
+    c=clean_camera(await small_json(request),old)
+    offset=await camera_clock(c)
     STORE.execute('UPDATE cameras SET name=?,host=?,port=?,username=?,password=?,path=?,enabled=?,compatible=?,onvif_port=? WHERE id=?',
-                  tuple(c[k] for k in ('name','host','port','username','password','path','enabled','compatible','onvif_port','id')))
-    return {'ok': True}
+        tuple(c[k] for k in ('name','host','port','username','password','path','enabled','compatible','onvif_port','id')))
+    STORE.execute('UPDATE cameras SET device_name=NULL,clock_offset=? WHERE id=?',(offset,cid))
+    return {'ok':True}
 
 
 @app.delete('/api/cameras/{cid}')
@@ -364,7 +351,7 @@ def recordings(camera: str = '', start: float = 0, end: float = 0, cursor: int =
 
 
 @app.get('/api/playback/{cid}.m3u8')
-def playback(cid: str, start: float, end: float):
+def playback(cid: str, start: float, end: float, compatible: bool = False):
     if end<=start or end-start>86400:
         raise HTTPException(400, 'Playback is limited to one day per playlist.')
     rows = STORE.rows('SELECT * FROM segments WHERE camera_id=? AND start+duration>? AND start<? ORDER BY start,id', (cid,start,end))
@@ -379,12 +366,21 @@ def playback(cid: str, start: float, end: float):
         if session != previous or (previous_end is not None and row['start']-previous_end>1):
             if previous is not None:
                 lines.append('#EXT-X-DISCONTINUITY')
-            lines.append(f'#EXT-X-MAP:URI="/api/inits/{cid}/{session}.mp4"')
+            if not compatible:lines.append(f'#EXT-X-MAP:URI="/api/inits/{cid}/{session}.mp4"')
         stamp = datetime.fromtimestamp(row['start'],timezone.utc).isoformat()
-        lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", f"/api/fragments/{row['id']}.m4s"]
+        lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", (f"/api/playback-preview/{row['id']}.ts" if compatible else f"/api/fragments/{row['id']}.m4s")]
         previous, previous_end = session, row['start']+row['duration']
     lines.append('#EXT-X-ENDLIST')
     return PlainTextResponse('\n'.join(lines)+'\n', media_type='application/vnd.apple.mpegurl')
+
+
+@app.get('/api/playback-preview/{sid}.ts')
+def playback_preview(sid:int):
+    rows=STORE.rows('SELECT * FROM segments WHERE id=?',(sid,))
+    if not rows:raise HTTPException(404,'This recording has expired.')
+    try:path=PREVIEWS.fragment(rows[0])
+    except ValueError as error:raise HTTPException(503,str(error))
+    return FileResponse(path,media_type='video/mp2t')
 
 
 @app.get('/api/inits/{cid}/{session}.mp4')

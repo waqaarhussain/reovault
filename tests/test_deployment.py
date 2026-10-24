@@ -116,7 +116,7 @@ if sys.argv[1:3]==['-m','venv']:
     for name in ('install',):
         p=bin_dir/name;p.write_text(p.read_text().replace('#!/usr/bin/env python3','#!/usr/bin/python3'))
     source=tmp_path/'source';source.mkdir(mode=0o700)
-    for name in ['app.py','core.py','capture.py','media_time.py','device.py','exporter.py','clip_input.py','requirements.txt','manage.py','realtime.py','install-live.sh','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
+    for name in ['app.py','core.py','capture.py','media_time.py','device.py','exporter.py','clip_input.py','requirements.txt','manage.py','realtime.py','playback_preview.py','install-live.sh','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
         p=source/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('placeholder');p.chmod(0o600)
     (source/'static').chmod(0o700)
     (source/'static/vendor').chmod(0o700)

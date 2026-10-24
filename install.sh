@@ -15,7 +15,7 @@ if [[ "${1:-}" == --update && ! -f /etc/reovault/config.json ]]; then
   exit 1
 fi
 src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-for required in app.py core.py capture.py media_time.py device.py exporter.py clip_input.py requirements.txt manage.py realtime.py install-live.sh bootstrap.sh update-live.sh static/vendor/hls.min.js; do
+for required in app.py core.py capture.py media_time.py device.py exporter.py clip_input.py requirements.txt manage.py realtime.py playback_preview.py install-live.sh bootstrap.sh update-live.sh static/vendor/hls.min.js; do
   [[ -s "$src_dir/$required" ]] || { echo "Missing package file: $required" >&2; exit 1; }
 done
 revision="${REOVAULT_REVISION:-local}"

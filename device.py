@@ -1,4 +1,4 @@
-"""Read-only ONVIF name and clock discovery."""
+"""Optional read-only ONVIF clock check. Camera labels are always entered manually."""
 import base64
 import hashlib
 import os
@@ -6,7 +6,6 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime,timezone
-from urllib.parse import unquote
 from xml.sax.saxutils import escape
 
 
@@ -15,7 +14,7 @@ NS='http://www.onvif.org/ver10/device/wsdl'
 
 def soap(camera,operation):
     port=int(camera.get('onvif_port') or 0)
-    if not port:raise ValueError('Set the forwarded ONVIF port to read the device name and clock.')
+    if not port:raise ValueError('Set the forwarded ONVIF port to check the camera clock.')
     nonce=os.urandom(20);created=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     digest=base64.b64encode(hashlib.sha1(nonce+created.encode()+camera['password'].encode()).digest()).decode()
     user=escape(camera['username'])
@@ -30,14 +29,7 @@ def soap(camera,operation):
 
 
 def discover(camera):
-    root,_=soap(camera,'GetScopes');name=None
-    for node in root.iter():
-        value=(node.text or '').strip()
-        if node.tag.endswith('ScopeItem') and '/name/' in value:
-            name=unquote(value.split('/name/',1)[1]).strip()
-            break
-    if not name or len(name)>60:raise ValueError('The camera did not return an ONVIF device name.')
-    result={'name':name,'clock_offset':None,'checked':time.time()}
+    result={'clock_offset':None,'checked':time.time()}
     try:
         root,midpoint=soap(camera,'GetSystemDateAndTime')
         utc=next(n for n in root.iter() if n.tag.endswith('UTCDateTime'))

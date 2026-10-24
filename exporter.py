@@ -72,7 +72,7 @@ class Exports:
             if result.returncode or not temporary.exists() or temporary.stat().st_size==0:raise ValueError('FFmpeg could not join that range without re-encoding. Try a smaller interval.')
             temporary.replace(output)
             job['warning']='Original-quality cuts follow camera keyframes; the edge may extend slightly outside your requested times.'
-            metadata={'camera':camera['device_name'] or camera['name'],'requested_start':a.isoformat(),'requested_end':b.isoformat(),
+            metadata={'camera':camera['name'],'requested_start':a.isoformat(),'requested_end':b.isoformat(),
                 'timezone':str(zone),'source_timing':sorted({r['timing_source'] for r in rows}),'video_reencoded':False,'boundary_note':job['warning']}
             output.with_suffix('.json').write_text(json.dumps(metadata,indent=2))
             job.update(status='complete',path=str(output),camera=camera['name'],start=start,end=end)

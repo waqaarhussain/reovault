@@ -146,7 +146,7 @@ class Store:
             if not camera:raise ValueError('Camera not found')
             name=camera['folder']
             if not name:
-                name=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',camera['device_name'] or camera['name']).strip(' .')[:80] or 'Camera'
+                name=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',camera['name']).strip(' .')[:80] or 'Camera'
                 used={c['folder'].casefold() for c in self.cameras(True) if c['folder']}
                 if name.casefold() in used:name+=' '+camera_id[:8]
                 self.execute('UPDATE cameras SET folder=? WHERE id=?',(name,camera_id))

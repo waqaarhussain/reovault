@@ -70,16 +70,15 @@ def api(action,**values):
 def select_camera(cameras,name=None):
     if not cameras:sys.exit('No cameras configured. Add a camera in the dashboard first.')
     if name:
-        matches=[c for c in cameras if name.casefold() in (c['name'].casefold(),(c.get('device_name') or '').casefold(),c['id'].casefold())]
+        matches=[c for c in cameras if name.casefold() in (c['name'].casefold(),c['id'].casefold())]
         if len(matches)==1:return matches[0]
         if not matches:print('Camera not found: '+name)
         else:print('More than one camera has that name. Choose its number.')
     for i,c in enumerate(cameras,1):
-        origin='device name' if c.get('device_name') else 'manual name'
-        print(f"{i}. {c['name']} [{origin}; recording {'ON' if c['record_enabled'] else 'OFF'}]")
+        print(f"{i}. {c['name']} [recording {'ON' if c['record_enabled'] else 'OFF'}]")
     choice=input('Camera name or number: ').strip()
     if choice.isdigit() and 1<=int(choice)<=len(cameras):return cameras[int(choice)-1]
-    matches=[c for c in cameras if choice.casefold() in (c['name'].casefold(),(c.get('device_name') or '').casefold())]
+    matches=[c for c in cameras if choice.casefold()==c['name'].casefold()]
     if len(matches)!=1:sys.exit('No unique camera selected. Run the helper again and choose its number.')
     return matches[0]
 

@@ -20,13 +20,13 @@ update-live
 
 If another application already owns that command, it is preserved; use `reovault update` instead. The updater builds an isolated code release before switching the current release and restarting the service. A failed startup check restores the previous code/service definition where available. Database migrations are not rolled back. Expect a short recording gap during restart.
 
-## Add cameras and read their actual names
+## Add cameras
 
 Keep your Reolink NVR in HyBridge mode and retain the current wiring. Reserve each camera's LAN address in eero. All three cameras can keep recording to the Reolink NVR independently.
 
 Give each camera a separate forwarded external **TCP RTSP** port, mapped to its internal RTSP port, normally 554. All dashboard entries may use the same home DDNS hostname. For a direct camera, start with `/Preview_01_main`; some firmware uses `/h264Preview_01_main`. Use the standalone camera credentials, which may differ from the NVR credentials.
 
-To read the **name configured on the camera**, also forward its ONVIF TCP port and enter that external port in the camera form. Reolink's ONVIF port is commonly 8000; check the actual device's port settings rather than assuming. Click **Read device name** to fill the name field, or save with an empty name and its ONVIF port set. A name you enter yourself is preserved on save; the ONVIF name is stored separately. The backend reads ONVIF name scopes and checks the camera's UTC clock. These are read-only operations; it does not change the name, clock, recording schedule, tracking, picture settings or NTP settings.
+Enter your own camera name, such as **Front Left**. Names are required and are used by the dashboard, record helper and new recording folders. ReoVault does not fetch ONVIF names or rename your cameras. Under Advanced connection settings, an optional forwarded ONVIF port enables a read-only UTC clock check. If that check fails, saving a manually named camera still works; recording timestamps continue to use RTCP.
 
 Example external mappings, replace the private camera addresses and actual internal ports:
 
@@ -36,7 +36,7 @@ Example external mappings, replace the private camera addresses and actual inter
 | TrackMix rear | 8552 | Camera 2 IP:554 | 8852 to Camera 2 ONVIF port |
 | E1 Pro | 8553 | Camera 3 IP:554 | 8853 to Camera 3 ONVIF port |
 
-RTSP alone does not reliably expose the device's configured display name. If ONVIF is not reachable or the firmware does not return its name, use a manual name and leave the ONVIF port blank. The helper labels manual names explicitly. It does not pretend a manual label was read from the camera. Different devices with identical names require selection by number.
+Different cameras can share the same label, but unique labels make the helpers easier to use. If names match, select the camera by number.
 
 Port forwarding requires a reachable public home IP. DDNS cannot bypass carrier-grade NAT or an upstream router. Camera HTTPS is not needed by this version. Only enable/forward the protocols actually being used.
 
@@ -133,7 +133,7 @@ download
 
 It asks:
 
-1. Camera name or number, using the names already read/stored by the app.
+1. Camera name or number, using the labels you entered in the app.
 2. Date in `DD/MM`, without the year. Blank means today; `yesterday` is also accepted. The current year is used and the timezone is printed.
 3. Start and end time, such as `0757pm - 08:10pm`.
 
@@ -197,3 +197,14 @@ Live tiles and live fullscreen have no native video transport/progress bar. Smal
 Live sound starts muted for browser autoplay. The speaker button unmutes, restores volume and explicitly resumes playback. WebRTC audio uses 48 kHz stereo Opus; source recordings retain their original audio. After unmuting, a short audio status message distinguishes missing RTP packets from incoming audio. `reovault diagnose` includes credential-free gateway codec and packet counters while a viewer is connected.
 
 For Ubuntu 22.04 compatibility, live audio uses a lazy `exec:` audio-only FFmpeg command rather than go2rtc’s `ffmpeg:` module, which rejects versions older than FFmpeg 5. The command works with older FFmpeg and reads a shared private loopback source; camera credentials are not added to the audio converter process arguments. No system FFmpeg upgrade is required. `reovault diagnose` now includes the installed FFmpeg version.
+
+
+## Browser playback previews
+
+Playback defaults to a temporary H.264/AAC preview up to 1280 × 720, generated only for the recorded fragments being requested. This works for saved HEVC footage even when the browser cannot decode the original. The quality selector can still request the original recording. The preview is derived from the saved main stream, not today's live camera substream, and follows the indexed camera capture times and recording gaps.
+
+This conversion uses VPS CPU while watching or seeking recorded footage. It does not re-encode the archive, exports, SFTP files or original downloads, and it does not change live viewing settings. One playback conversion runs at a time, using two FFmpeg threads. Disposable previews are cached in `/var/lib/reovault/playback-cache`; requests prune entries older than 30 minutes and reduce older cached data toward 256 MiB. Recently requested files can temporarily exceed that target. Free disk reserve is checked before creating a preview.
+
+The Playback page fits the viewport. Recording blocks scroll within the side panel on desktop, or horizontally below the player on phones; the timeline stays visible. **Downloads** opens the original segment list in a dialog. Signing out clears the camera tiles and their player objects together, so signing back in rebuilds live players correctly.
+
+The dashboard has been redesigned with top navigation, new live camera tiles, a viewport-sized recording workspace, and accessible switch controls. Automatic ONVIF name lookup has been removed. Optional ONVIF clock checks never overwrite manual labels. Existing archive folders and saved files stay in place.

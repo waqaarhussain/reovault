@@ -48,6 +48,7 @@ def test_auth_and_csrf(app_module,client):
     outsider=TestClient(app_module.app)
     assert outsider.get('/api/status').status_code==401
     assert outsider.get('/media/live/x/y/index.m3u8').status_code==401
+    assert outsider.get('/api/playback-preview/1.ts').status_code==401
     assert outsider.post('/api/login',json={'username':'admin','password':'bad'}).status_code==401
     outsider.close()
     headers=dict(client.headers)
@@ -104,6 +105,11 @@ def test_timeline_split_at_group_boundary_gaps_and_playlist(app_module,client):
     assert manifest.text.count('#EXT-X-MAP:')==2
     assert '#EXT-X-DISCONTINUITY' in manifest.text
     assert manifest.text.rstrip().endswith('#EXT-X-ENDLIST')
+    preview=client.get('/api/playback/'+cid+'.m3u8',params={'start':1800,'end':3600,'compatible':True})
+    assert '/api/playback-preview/' in preview.text and '#EXT-X-MAP' not in preview.text
+    assert '#EXT-X-DISCONTINUITY' in preview.text
+    assert '#EXT-X-PROGRAM-DATE-TIME:' in preview.text
+    assert client.get('/api/playback-preview/999999.ts').status_code==404
     sid=client.get('/api/recordings',params={'camera':cid,'start':0,'end':86400}).json()['segments'][0]['id']
     download=client.get('/api/download/'+str(sid))
     assert download.content==b'init'+b'x'*400
@@ -222,21 +228,21 @@ def test_ubuntu_ffmpeg_timeout_option(monkeypatch):
     core.rtsp_timeout.cache_clear()
 
 
-def test_device_names_and_local_helper_do_not_enable_future_cameras(app_module,client,monkeypatch):
+def test_manual_names_and_local_helper_do_not_enable_future_cameras(app_module,client,monkeypatch):
     from fastapi.testclient import TestClient
     monkeypatch.setattr(app_module,'discover',lambda c:{'name':'Camera supplied name','clock_offset':0.2,'checked':time.time()})
-    body={'name':'','host':'home.eero.online','port':8551,'onvif_port':8851,'username':'admin','password':'test','path':'/Preview_01_main'}
+    body={'name':'Front Left','host':'home.eero.online','port':8551,'onvif_port':8851,'username':'admin','password':'test','path':'/Preview_01_main'}
     result=client.post('/api/cameras',json=body)
     assert result.status_code==200,result.text
     first=result.json()['id']
-    assert app_module.STORE.camera(first)['name']=='Camera supplied name'
-    assert app_module.STORE.camera(first)['device_name']=='Camera supplied name'
+    assert app_module.STORE.camera(first)['name']=='Front Left'
+    assert app_module.STORE.camera(first)['device_name'] is None
     assert app_module.STORE.camera(first)['record_enabled']==0
     helper=TestClient(app_module.app,client=('127.0.0.1',12345))
     headers={'X-Control-Token':'private-control'}
     assert helper.post('/api/control',headers=headers,json={'action':'start','camera_id':first}).status_code==200
     monkeypatch.setattr(app_module,'discover',lambda c:{'name':'Second camera','clock_offset':0.1,'checked':time.time()})
-    second=client.post('/api/cameras',json={**body,'port':8552,'onvif_port':8852}).json()['id']
+    second=client.post('/api/cameras',json={**body,'name':'Rear','port':8552,'onvif_port':8852}).json()['id']
     assert app_module.STORE.camera(first)['record_enabled']==1
     assert app_module.STORE.camera(second)['record_enabled']==0
     assert helper.post('/api/control',headers=headers,json={'action':'start','camera_id':second}).status_code==200
@@ -255,8 +261,10 @@ def test_manual_camera_name_survives_onvif_refresh(app_module,client,monkeypatch
     assert app_module.STORE.camera(cid)['name']=='Front Left'
     assert client.put('/api/cameras/'+cid,json={**body,'name':'Driveway'}).status_code==200
     camera=app_module.STORE.camera(cid)
-    assert camera['name']=='Driveway' and camera['device_name']=='IPC-BO'
+    assert camera['name']=='Driveway' and camera['device_name'] is None
     assert camera['record_enabled']==0
+    assert client.post('/api/cameras',json={**body,'name':''}).status_code==400
+    assert client.post('/api/camera-name',json=body).status_code==404
 
 
 def test_mode_controls_preserve_camera_choices_and_block_live(app_module,client):
@@ -410,3 +418,14 @@ def test_webrtc_signalling_requires_login_csrf_and_live_mode(app_module,client,m
     assert client.post('/api/live/'+cid+'/webrtc',json=payload).status_code==403
     assert client.post('/api/live/'+cid+'/fallback').status_code==403
     assert len(calls)==1
+
+
+def test_optional_onvif_clock_never_requests_device_name(monkeypatch):
+    import device
+    calls=[]
+    def unavailable(camera,operation):
+        calls.append(operation)
+        raise ValueError('Clock unavailable')
+    monkeypatch.setattr(device,'soap',unavailable)
+    assert device.discover({'onvif_port':2005})['clock_offset'] is None
+    assert calls==['GetSystemDateAndTime']
