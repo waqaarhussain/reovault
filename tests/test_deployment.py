@@ -115,9 +115,11 @@ if sys.argv[1:3]==['-m','venv']:
     # Mock executables use /usr/bin/python3 to avoid recursively invoking the venv stub.
     for name in ('install',):
         p=bin_dir/name;p.write_text(p.read_text().replace('#!/usr/bin/env python3','#!/usr/bin/python3'))
-    source=tmp_path/'source';source.mkdir()
+    source=tmp_path/'source';source.mkdir(mode=0o700)
     for name in ['app.py','core.py','capture.py','media_time.py','device.py','exporter.py','clip_input.py','requirements.txt','manage.py','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
-        p=source/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('placeholder')
+        p=source/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('placeholder');p.chmod(0o600)
+    (source/'static').chmod(0o700)
+    (source/'static/vendor').chmod(0o700)
     (fs/'root').mkdir(exist_ok=True)
     script=scoped((ROOT/'install.sh').read_text())
     import re
@@ -140,4 +142,9 @@ if sys.argv[1:3]==['-m','venv']:
         assert (base/'current').resolve()!=old
         assert (base/'current/REVISION').read_text().strip()==SHA
         assert (base/'current/venv/bin/python').exists()
+        release=(base/'current').resolve()
+        assert release.stat().st_mode & 0o777 == 0o755
+        assert (release/'static/vendor').stat().st_mode & 0o777 == 0o755
+        assert (release/'app.py').stat().st_mode & 0o777 == 0o644
+        assert (release/'static/vendor/hls.min.js').stat().st_mode & 0o777 == 0o644
         assert 'Preserved it.' in result.stdout

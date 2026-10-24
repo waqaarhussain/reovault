@@ -23,7 +23,7 @@ revision="${REOVAULT_REVISION:-local}"
 umask 022
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y python3 python3-venv python3-pip ffmpeg rsync ca-certificates curl
+apt-get -o DPkg::Lock::Timeout=600 install -y python3 python3-venv python3-pip ffmpeg rsync ca-certificates curl
 id reovault >/dev/null 2>&1 || useradd --system --home-dir /var/lib/reovault --shell /usr/sbin/nologin reovault
 install -d -m 0755 /opt/reovault /opt/reovault/releases
 install -d -m 0750 -o reovault -g reovault /var/lib/reovault
@@ -70,8 +70,10 @@ rollback() {
   exit "$result"
 }
 trap rollback EXIT
-rsync -a --exclude='.git' --exclude='.venv' --exclude='venv' --exclude='__pycache__' \
+# Bootstrap extraction may be private (0700). Never inherit that mode into service code.
+rsync -a --chmod=D755,F644 --exclude='.git' --exclude='.venv' --exclude='venv' --exclude='__pycache__' \
   --exclude='.pytest_cache' --exclude='*.sqlite*' --exclude='test-data' "$src_dir/" "$release_dir/"
+chmod 0755 "$release_dir" "$release_dir/"*.sh
 # The environment is built at its final path; venv launchers contain absolute paths.
 # The current application keeps running while the next environment is prepared.
 python3 -m venv "$release_dir/venv"
