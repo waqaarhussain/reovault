@@ -8,3 +8,5 @@
  #cameraForm .switch-row{min-height:66px;padding:13px 0}
  #cameraForm .drawer-heading{margin-bottom:16px}
 }
+
+.timeline-title{display:flex;align-items:center;gap:12px}.timeline-tools{display:flex;gap:3px}.timeline-tools button{display:grid;place-items:center;width:25px;height:25px;padding:0;background:transparent;border:1px solid #303946;border-radius:5px;font-size:16px;color:#a5b4c8;line-height:1}.timeline-tools button:hover{background:#27313e}.timeline-tools button:disabled{opacity:.25;cursor:default}.camera-footer>div{min-width:0}.camera-footer b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#timelineRanges{position:absolute;inset:0;overflow:hidden;border-radius:4px;pointer-events:none}.playback-caption b{white-space:normal;line-height:1.3}@media(max-width:760px){.timeline-title{gap:8px}.timeline-tools{gap:2px}.timeline-tools button{width:23px;height:23px}.timeline-heading .legend{display:none}}
