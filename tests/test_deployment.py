@@ -116,10 +116,11 @@ if sys.argv[1:3]==['-m','venv']:
     for name in ('install',):
         p=bin_dir/name;p.write_text(p.read_text().replace('#!/usr/bin/env python3','#!/usr/bin/python3'))
     source=tmp_path/'source';source.mkdir(mode=0o700)
-    for name in ['app.py','core.py','capture.py','media_time.py','device.py','exporter.py','clip_input.py','requirements.txt','manage.py','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
+    for name in ['app.py','core.py','capture.py','media_time.py','device.py','exporter.py','clip_input.py','requirements.txt','manage.py','realtime.py','install-live.sh','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
         p=source/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('placeholder');p.chmod(0o600)
     (source/'static').chmod(0o700)
     (source/'static/vendor').chmod(0o700)
+    (source/'install-live.sh').write_text('#!/bin/sh\nexit 0\n')
     (fs/'root').mkdir(exist_ok=True)
     script=scoped((ROOT/'install.sh').read_text())
     import re
@@ -148,3 +149,23 @@ if sys.argv[1:3]==['-m','venv']:
         assert (release/'app.py').stat().st_mode & 0o777 == 0o644
         assert (release/'static/vendor/hls.min.js').stat().st_mode & 0o777 == 0o644
         assert 'Preserved it.' in result.stdout
+
+
+@pytest.mark.parametrize('valid_download',[True,False])
+def test_live_binary_download_checks_pinned_hash(tmp_path,valid_download):
+    import hashlib
+    bin_dir=tmp_path/'bin';bin_dir.mkdir()
+    executable(bin_dir/'dpkg','#!/bin/sh\necho amd64\n')
+    executable(bin_dir/'curl',"""#!/usr/bin/python3
+import os,pathlib,sys
+args=sys.argv[1:]
+pathlib.Path(args[args.index('-o')+1]).write_bytes(b'verified test binary' if os.environ['TEST_GOOD']=='1' else b'corrupt download')
+""")
+    source=(ROOT/'install-live.sh').read_text()
+    expected=hashlib.sha256(b'verified test binary').hexdigest()
+    source=source.replace('32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6',expected)
+    source=source.replace('/opt/reovault/current/bin/go2rtc',str(tmp_path/'no-cache'))
+    script=tmp_path/'install-live.sh';script.write_text(source)
+    result=subprocess.run(['bash',str(script),str(tmp_path/'release')],capture_output=True,text=True,env={**os.environ,'PATH':str(bin_dir)+os.pathsep+os.environ['PATH'],'TEST_GOOD':'1' if valid_download else '0'})
+    assert (result.returncode==0)==valid_download
+    assert (tmp_path/'release/bin/go2rtc').exists()==valid_download

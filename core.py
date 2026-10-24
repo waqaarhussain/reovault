@@ -81,6 +81,7 @@ class Store:
         self.setting_default('reserve_gb',2)
         self.setting_default('timezone','Europe/London')
         self.setting_default('mode','both')
+        self.setting_default('webrtc_public_ip',None)
         self.setting_default('recordings_root',os.environ.get('REOVAULT_RECORDINGS',str(self.root/'Reolink')))
         self.recordings_root=Path(os.environ.get('REOVAULT_RECORDINGS',self.get('recordings_root')))
         self.recordings_root.mkdir(parents=True,exist_ok=True)
@@ -295,6 +296,8 @@ class Worker:
         self.store, self.camera = store, camera
         self.preview_only=preview_only
         self.preview_worker=None
+        self.realtime_ready=False
+        self.hls_demand_until=0
         self.session = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
         self.folder = Path(folder) if folder is not None else store.root / 'live' / camera['id'] / self.session
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -456,6 +459,9 @@ class Worker:
         if self.preview_only or not self.camera['compatible'] or self.mode=='storage':return False
         camera=native_preview_camera(self.camera)
         if camera is None:return False
+        if self.realtime_ready and time.time()>self.hls_demand_until:
+            if self.preview_worker is not None:self.preview_worker.stop();self.preview_worker=None
+            return True
         worker=self.preview_worker
         if worker is not None:
             worker.poll_probe();worker.ingest()
@@ -516,6 +522,8 @@ class Engine:
         self.thread = None
         self.error = None
         self.diagnostic = None
+        from realtime import Realtime
+        self.realtime=Realtime(store)
 
     def start(self):
         self.store.reconcile()
@@ -541,6 +549,7 @@ class Engine:
                     last_prune = time.time()
                 mode=self.store.get('mode')
                 cameras = self.desired_cameras()
+                self.realtime.sync(cameras,mode)
                 with self.lock:
                     for cid in list(self.workers):
                         worker = self.workers[cid]
@@ -550,6 +559,7 @@ class Engine:
                     for cid, camera in cameras.items():
                         worker = self.workers.get(cid)
                         if worker:
+                            worker.realtime_ready=self.realtime.status()['available']
                             worker.poll_probe()
                             worker.ingest()
                             dead = worker.probe is None and (worker.process is None or worker.process.poll() is not None)
@@ -580,6 +590,7 @@ class Engine:
             for worker in self.workers.values():
                 worker.stop()
             self.workers.clear()
+        self.realtime.stop()
 
     def desired_cameras(self):
         storage_only=self.store.get('mode')=='storage'

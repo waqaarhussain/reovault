@@ -15,7 +15,7 @@ if [[ "${1:-}" == --update && ! -f /etc/reovault/config.json ]]; then
   exit 1
 fi
 src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-for required in app.py core.py capture.py media_time.py device.py exporter.py clip_input.py requirements.txt manage.py bootstrap.sh update-live.sh static/vendor/hls.min.js; do
+for required in app.py core.py capture.py media_time.py device.py exporter.py clip_input.py requirements.txt manage.py realtime.py install-live.sh bootstrap.sh update-live.sh static/vendor/hls.min.js; do
   [[ -s "$src_dir/$required" ]] || { echo "Missing package file: $required" >&2; exit 1; }
 done
 revision="${REOVAULT_REVISION:-local}"
@@ -74,12 +74,17 @@ trap rollback EXIT
 rsync -a --chmod=D755,F644 --exclude='.git' --exclude='.venv' --exclude='venv' --exclude='__pycache__' \
   --exclude='.pytest_cache' --exclude='*.sqlite*' --exclude='test-data' "$src_dir/" "$release_dir/"
 chmod 0755 "$release_dir" "$release_dir/"*.sh
+bash "$release_dir/install-live.sh" "$release_dir"
 # The environment is built at its final path; venv launchers contain absolute paths.
 # The current application keeps running while the next environment is prepared.
 python3 -m venv "$release_dir/venv"
 "$release_dir/venv/bin/pip" install --disable-pip-version-check -r "$release_dir/requirements.txt"
 "$release_dir/venv/bin/python" -m compileall -q "$release_dir/app.py" "$release_dir/core.py" "$release_dir/manage.py"
 REOVAULT_RECORDINGS=/Reolink "$release_dir/venv/bin/python" "$release_dir/manage.py" setup
+rtc_public_ip="$(curl -4fsS --connect-timeout 3 --max-time 5 https://api.ipify.org || true)"
+if [[ "$rtc_public_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  REOVAULT_PUBLIC_IP="$rtc_public_ip" REOVAULT_RECORDINGS=/Reolink "$release_dir/venv/bin/python" "$release_dir/manage.py" network
+fi
 chown root:reovault /etc/reovault/config.json
 chmod 0640 /etc/reovault/config.json
 # Initial setup creates the DB as root. Existing video trees are never recursively changed.
@@ -113,7 +118,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 ReadWritePaths=/var/lib/reovault /Reolink
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -187,7 +192,8 @@ printf '\nReoVault ready. Revision: %.12s\nDashboard: http://%s:8765\n' "$revisi
 cat <<'DONE'
 
 Sign in with the dashboard credentials you chose, then add your cameras.
-Allow inbound TCP 8765 in your VPS/provider firewall if needed.
+Allow inbound TCP 8765 for the dashboard and TCP/UDP 8555 for low-latency live video in your VPS/provider firewall.
+Home camera forwards are unchanged. WebRTC control ports remain private.
 No firewall rules were changed automatically.
 
 Start one camera:  record "Camera Name"

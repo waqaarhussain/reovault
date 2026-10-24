@@ -377,3 +377,23 @@ def test_error_diagnostics_never_include_url_password_or_exception_message():
     value=json.dumps(detail)
     assert detail['type']=='ValueError' and detail['frames']
     assert 'very-private-password' not in value and 'example.invalid' not in value and 'rtsp://' not in value
+
+
+def test_webrtc_signalling_requires_login_csrf_and_live_mode(app_module,client,monkeypatch):
+    cid=add_camera(client);calls=[]
+    def answer(camera_id,sdp):calls.append((camera_id,sdp));return 'v=0\r\ns=answer\r\n'
+    monkeypatch.setattr(app_module.ENGINE.realtime,'answer',answer)
+    outsider=TestClient(app_module.app)
+    payload={'type':'offer','sdp':'v=0\r\ns=offer\r\n'}
+    assert outsider.post('/api/live/'+cid+'/webrtc',json=payload).status_code==401
+    outsider.close()
+    token=client.headers.pop('X-CSRF-Token')
+    assert client.post('/api/live/'+cid+'/webrtc',json=payload).status_code==403
+    client.headers['X-CSRF-Token']=token
+    result=client.post('/api/live/'+cid+'/webrtc',json=payload)
+    assert result.status_code==200 and result.json()['type']=='answer' and calls==[(cid,payload['sdp'])]
+    assert client.post('/api/live/'+cid+'/webrtc',json={'type':'answer','sdp':'bad'}).status_code==400
+    app_module.STORE.set_mode('storage')
+    assert client.post('/api/live/'+cid+'/webrtc',json=payload).status_code==403
+    assert client.post('/api/live/'+cid+'/fallback').status_code==403
+    assert len(calls)==1

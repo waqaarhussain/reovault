@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -144,7 +145,7 @@ def status(request: Request):
                                        'live_url': None, 'compatible_url': None, 'session': None}))
         cameras.append(c)
     return {'cameras': cameras, 'mode':STORE.get('mode'),'recording':any(c['record_active'] for c in cameras), 'timezone':STORE.get('timezone'), 'storage': STORE.storage(),
-            'engine_warning': ENGINE.error, 'csrf': csrf(request.cookies.get('reovault_session', '')),
+            'engine_warning': ENGINE.error, 'realtime':ENGINE.realtime.status(), 'csrf': csrf(request.cookies.get('reovault_session', '')),
             'username': SETTINGS.get('username', 'admin'), 'server_time': time.time()}
 
 
@@ -268,6 +269,7 @@ async def control(request: Request):
         raise HTTPException(403)
     body = await small_json(request)
     action=body.get('action');cid=str(body.get('camera_id',''))
+    if action=='rtc-status':return ENGINE.realtime.status()
     if action=='mode':
         try:STORE.set_mode(body.get('mode'))
         except ValueError as e:raise HTTPException(400,str(e))
@@ -304,6 +306,40 @@ def media(kind: str, relative: str):
     path = safe_path(STORE.root / kind, relative)
     types = {'.m3u8': 'application/vnd.apple.mpegurl', '.m4s': 'video/mp4', '.mp4': 'video/mp4'}
     return FileResponse(path, media_type=types[path.suffix])
+
+
+def live_camera(cid):
+    camera=STORE.camera(cid)
+    if STORE.get('mode')=='storage':raise HTTPException(403,'Live viewing is disabled in storage-only mode.')
+    if not camera or camera['deleted'] or not camera['enabled']:raise HTTPException(404,'Camera unavailable.')
+    return camera
+
+
+@app.post('/api/live/{cid}/webrtc')
+async def webrtc_offer(cid:str,request:Request):
+    live_camera(cid)
+    body=await small_json(request)
+    sdp=body.get('sdp')
+    if body.get('type')!='offer' or not isinstance(sdp,str) or not sdp.startswith('v=0'):
+        raise HTTPException(400,'Expected a WebRTC offer.')
+    try:answer=await run_in_threadpool(ENGINE.realtime.answer,cid,sdp)
+    except ValueError as error:raise HTTPException(503,str(error))
+    return {'type':'answer','sdp':answer}
+
+
+@app.post('/api/live/{cid}/fallback')
+async def live_fallback(cid:str):
+    camera=live_camera(cid)
+    for _ in range(100):
+        with ENGINE.lock:
+            worker=ENGINE.workers.get(cid)
+            if worker:
+                worker.hls_demand_until=time.time()+180
+                status=worker.status()
+                url=status['compatible_url'] if camera['compatible'] else status['live_url']
+                if url:return {'url':url}
+        await asyncio.sleep(.25)
+    raise HTTPException(503,'Buffered preview is still connecting. Try again shortly.')
 
 
 @app.get('/api/recordings')

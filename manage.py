@@ -124,6 +124,7 @@ def mode_command(args):
 def diagnose_command():
     data=api('status')
     print('Mode: '+data.get('mode','both'))
+    print('WebRTC: '+json.dumps(api('rtc-status')))
     print('Engine warning: '+str(data.get('engine_warning') or 'none'))
     print('Engine diagnostic: '+json.dumps(data.get('engine_diagnostic')))
     for c in data['cameras']:
@@ -192,5 +193,9 @@ if __name__=='__main__':
     elif args==['password']:reset_password()
     elif args==['download']:download_command()
     elif args==['diagnose']:diagnose_command()
+    elif args==['network']:
+        import ipaddress
+        value=str(ipaddress.IPv4Address(os.environ['REOVAULT_PUBLIC_IP']))
+        store=Store(DATA);store.set('webrtc_public_ip',value);store.db.close()
     elif args and args[0]=='mode':mode_command(args[1:])
     else:record_command(args)

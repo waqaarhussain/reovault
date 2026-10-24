@@ -162,7 +162,7 @@ reovault version
 update-live
 ```
 
-No existing NVR history is imported, no internet-outage gaps are recovered, and this version does not implement PTZ controls, event detection or notifications. Original HEVC playback depends on the viewing device. Compatible live viewing uses the camera’s existing H.264 substream for standard Reolink paths. The substream is lower resolution and can add camera upload traffic and another camera connection, but requires no VPS video conversion. A nonstandard path uses the original server-conversion fallback up to 1080p. Saved HEVC recordings still need a player that supports that codec. Chromium uses Hls.js for playback; Safari retains native HLS. This is still segmented HLS, so it adds buffering and is not promised to match the Reolink app’s latency. No camera settings are changed.
+No existing NVR history is imported, no internet-outage gaps are recovered, and this version does not implement PTZ controls, event detection or notifications. Original HEVC playback depends on the viewing device. Compatible live viewing uses the camera’s existing H.264 substream for standard Reolink paths. The substream is lower resolution and can add camera upload traffic and another camera connection, but requires no VPS video conversion. A nonstandard path uses the original server-conversion fallback up to 1080p. Saved HEVC recordings still need a player that supports that codec. WebRTC is tried first for live viewing. Buffered HLS remains the fallback: Chromium uses Hls.js and Safari retains native HLS for that fallback. Buffered playback is not promised to match the Reolink app’s latency. No camera settings are changed.
 
 ## Validation
 
@@ -179,3 +179,17 @@ hls.js is bundled under its license in `static/vendor/hls.LICENSE.txt`. PyAV is 
 ## Camera connection diagnostics
 
 Run `reovault diagnose` if a camera connects during codec discovery but remains reconnecting. It reports operating mode, engine error type/location, camera stream status, the latest capture failure and whether PyAV imports. Structural diagnostics omit raw third-party exception messages, URLs, credentials, source text and local variable contents. Share this helper output rather than a credential-bearing RTSP URL.
+
+## Low-latency live viewing
+
+Live viewing now tries WebRTC first, using pinned go2rtc v1.9.14 installed with a SHA-256 check. Allow inbound TCP and UDP 8555 on the VPS/provider firewall as well as TCP 8765 for the dashboard. Your home camera forwarding rules do not change. The installer detects the VPS public IPv4 address; no domain or dashboard certificate is required by this setup. `reovault diagnose` reports the media service state and any safe negotiation error.
+
+The WebRTC API remains on loopback port 19844 and internal RTSP on loopback port 18555. Browser offers go through the existing authenticated, CSRF-protected dashboard API. Only WebRTC's media port 8555 is public. Do not publish the private control/config file in `/var/lib/reovault/realtime`. The systemd service permits AF_NETLINK for network-interface discovery, in addition to Internet and Unix sockets.
+
+Compatible viewing uses the existing Reolink H.264 substream without video re-encoding; original viewing offers the main stream where the browser can negotiate its codec. AAC audio can be adapted to Opus for live WebRTC only. Recorded/exported video and audio still come from the main capture process. WebRTC does not use HLS's segment buffer, but actual latency depends on the camera and network and is not guaranteed.
+
+If WebRTC is unavailable or cannot connect, buffered HLS is used and the tile says BUFFERED. An HLS preview connection is requested only for that fallback while WebRTC is available, with a renewable short lease; storage-only mode stops both preview and media service. Leaving the live tab, hiding the page or signing out closes the browser's live connection. Existing recording switches and all archive/export paths are unchanged.
+
+WebRTC browser playback does not expose the same UTC frame reference as HLS. The UI labels WebRTC transport and whether the separate recorder's camera clock is verified, rather than displaying a guessed frame timestamp. Any timestamp burned into the camera picture remains unchanged.
+
+Live tiles and live fullscreen have no native video transport/progress bar. Small sound and fullscreen buttons remain. Browsers without element fullscreen use a page-level full viewport view to avoid forcing native video controls. Recorded playback retains its timeline and transport controls.
