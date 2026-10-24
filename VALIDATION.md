@@ -1,17 +1,15 @@
-# Build validation
+# Validation, 24 October 2026
 
-Validated on 24 October 2026 with synthetic video and a local RTSP test server. No real camera credentials or footage are included.
+Eighteen automated tests passed for this build.
 
-- Seven automated tests passed: authentication, session invalidation, CSRF, private camera credentials, camera lifecycle, timeline grouping boundaries, recording gaps, discontinuities, original downloads, oldest-first retention, interrupted-copy reconciliation, recording state persistence, H.264 and H.265 decoding, HEVC hvc1 tagging, and FFmpeg timeout option selection.
-- An actual RTSP source through MediaMTX was read by the engine. Standby generated no archive footage; enabling recording created completed archive fragments; stopping recording left live streaming online.
-- The same RTSP test passed with the optional compatible H.264 preview enabled.
-- Chromium browser checks passed: login, three live video players, archive playback with real decoded frames, hourly versus half-hour grouping, mobile camera form, no JavaScript page errors, and no horizontal overflow at a 390-pixel viewport.
-- Desktop and mobile screenshots were inspected during development. Screenshots and synthetic fixture footage are not part of this package.
-- JavaScript syntax, Python compilation and shell syntax checks passed.
-- All pinned runtime dependencies resolved to Python 3.10-compatible wheels, including the compiled Pydantic dependency. The development runtime itself was Python 3.12, rather than a full Ubuntu 22.04 virtual machine.
+The tests exercise individual recording switches; newly added cameras remaining off; restart persistence; one-time migration of the old global switch; real H.264/H.265 fragments and original-codec exports; recording rotation preserving saved clips; ONVIF-derived names; protected local control requests; date formats including `0757pm - 08:10pm`; DST repeated/nonexistent times; camera packet reference timestamps; waiting for verified timestamps before archiving; timeline grouping and gaps; authentication; credential handling; pinned-commit downloads; interactive bootstrap input; code activation and failed-start rollback.
 
-Still to validate after installation: your camera stream URLs and secondary TrackMix lens URLs, DDNS and public port forwarding, actual codecs and resolutions, sustained 4K throughput, original-codec playback on your iPhone, and installation/service behaviour on your Ubuntu VPS. These cannot be confirmed from the development environment.
+A local MediaMTX RTSP test with synthetic video passed using the actual capture subprocess and PyAV 17.1.0. The stream supplied RTCP sender references. The engine started live view without archiving, indexed footage using those references after enabling that camera, and stopped archiving while keeping live view online. The compatible live-preview test also passed and published camera-mapped timestamps for its delayed preview.
 
-The dashboard intentionally uses HTTP at the VPS IP. Neither HTTP nor ordinary RTSP over TCP encrypts traffic. This follows the requested deployment design.
+Chromium checks passed for sign-in, live video, recorded playback, hourly versus half-hour grouping, the camera form, no JavaScript errors and no horizontal overflow on a 390-pixel mobile viewport. Source timestamps and clip exports were tested using generated video; the fixture is not real security footage and is not included in the repository.
 
-GitHub deployment additions: four deployment-script tests passed, covering commit-pinned downloads, interactive installer input, invalid revision rejection, code activation, failed-start rollback, preservation of recordings/settings and preservation of another application's updater. Together with the recording-system tests, the suite has eleven passing tests.
+All runtime requirements resolved to Python 3.10-compatible wheels for Ubuntu 22.04's interpreter, including PyAV 17.1.0. The development runtime itself was Python 3.12, rather than a complete Ubuntu 22.04 VM. Shell syntax, JavaScript syntax, Python compilation and Git whitespace checks passed.
+
+Still to verify after installation: actual Reolink firmware RTCP sender-reference availability, standalone camera ONVIF names, the camera's configured clock/overlay timezone, DDNS and port forwarding, sustained 4K throughput, target-device HEVC playback, SFTP permissions for the actual Termius login, and systemd installation on the user's VPS.
+
+If a real device provides no verified capture reference, this build intentionally waits before archiving rather than substituting server arrival time. Original-codec exports use camera keyframes and can extend slightly beyond requested edges; frame-exact arbitrary trimming is not promised. An incorrectly set camera clock or overlay timezone is reported/read as supplied, not silently changed.

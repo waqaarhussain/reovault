@@ -2,6 +2,8 @@
 import hashlib
 import json
 import os
+import re
+import sys
 import shutil
 import sqlite3
 import subprocess
@@ -11,6 +13,7 @@ import uuid
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
 
@@ -53,10 +56,27 @@ class Store:
             CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,expires REAL NOT NULL);
         ''')
         self.db.commit()
-        self.setting_default('recording', False)
-        self.setting_default('record_since', 0)
-        self.setting_default('quota_gb', 100)
-        self.setting_default('reserve_gb', 2)
+        columns={r[1] for r in self.db.execute('PRAGMA table_info(cameras)')}
+        for name,definition in {'record_enabled':'INTEGER NOT NULL DEFAULT 0','record_since':'REAL NOT NULL DEFAULT 0',
+                'folder':'TEXT','onvif_port':'INTEGER NOT NULL DEFAULT 0','device_name':'TEXT','clock_offset':'REAL'}.items():
+            if name not in columns:self.db.execute(f'ALTER TABLE cameras ADD COLUMN {name} {definition}')
+        columns={r[1] for r in self.db.execute('PRAGMA table_info(segments)')}
+        for name,definition in {'relative_path':'TEXT','init_size':'INTEGER NOT NULL DEFAULT 0','timing_source':"TEXT NOT NULL DEFAULT 'legacy-server'"}.items():
+            if name not in columns:self.db.execute(f'ALTER TABLE segments ADD COLUMN {name} {definition}')
+        self.db.commit()
+        self.setting_default('recording',False)
+        self.setting_default('record_since',0)
+        self.setting_default('quota_gb',100)
+        self.setting_default('reserve_gb',2)
+        self.setting_default('timezone','Europe/London')
+        self.setting_default('recordings_root',os.environ.get('REOVAULT_RECORDINGS',str(self.root/'Reolink')))
+        self.recordings_root=Path(os.environ.get('REOVAULT_RECORDINGS',self.get('recordings_root')))
+        self.recordings_root.mkdir(parents=True,exist_ok=True)
+        # Preserve existing enabled cameras once; future INSERTs always retain DEFAULT 0.
+        if not self.rows("SELECT key FROM settings WHERE key='per_camera_recording_v1'"):
+            if self.get('recording'):
+                self.execute('UPDATE cameras SET record_enabled=1,record_since=? WHERE deleted=0',(self.get('record_since'),))
+            self.set('per_camera_recording_v1',True)
 
     def execute(self, sql, args=()):
         with self.lock:
@@ -84,15 +104,38 @@ class Store:
         rows = self.rows('SELECT * FROM cameras WHERE id=?', (camera_id,))
         return rows[0] if rows else None
 
-    def record(self, enabled):
+    def record(self, camera_id, enabled):
         with self.lock:
-            # One transaction: the worker cannot observe a new switch with an old timestamp.
-            if enabled and not self.get('recording'):
-                self.set('record_since', time.time())
-            self.set('recording', bool(enabled))
+            camera=self.camera(camera_id)
+            if not camera or camera['deleted']:raise ValueError('Camera not found')
+            since=time.time() if enabled and not camera['record_enabled'] else camera['record_since']
+            self.camera_folder(camera_id)
+            self.execute('UPDATE cameras SET record_enabled=?,record_since=? WHERE id=?',(int(enabled),since,camera_id))
 
-    def archive_path(self, row):
-        return self.root / 'archive' / row['camera_id'] / row['session'] / row['name']
+    def camera_folder(self,camera_id):
+        with self.lock:
+            camera=self.camera(camera_id)
+            if not camera:raise ValueError('Camera not found')
+            name=camera['folder']
+            if not name:
+                name=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',camera['device_name'] or camera['name']).strip(' .')[:80] or 'Camera'
+                used={c['folder'].casefold() for c in self.cameras(True) if c['folder']}
+                if name.casefold() in used:name+=' '+camera_id[:8]
+                self.execute('UPDATE cameras SET folder=? WHERE id=?',(name,camera_id))
+            folder=self.recordings_root/name
+            folder.mkdir(parents=True,exist_ok=True)
+            return folder
+
+    def archive_path(self,row):
+        if row.get('relative_path'):
+            return self.recordings_root/row['relative_path']
+        return self.root/'archive'/row['camera_id']/row['session']/row['name']
+
+    def initialization(self,row):
+        path=self.archive_path(row)
+        if row.get('init_size'):
+            with path.open('rb') as handle:return handle.read(row['init_size'])
+        return (path.parent/'init.mp4').read_bytes()
 
     def storage(self):
         total = self.rows('SELECT COALESCE(SUM(size),0) AS n FROM segments')[0]['n']
@@ -100,9 +143,13 @@ class Store:
         total += sum(p.stat().st_size for p in (self.root / 'archive').glob('*/*/init.mp4') if p.exists())
         disk = shutil.disk_usage(self.root)
         return {'used_bytes': total, 'quota_bytes': self.get('quota_gb') * 10**9,
-                'disk_free_bytes': disk.free, 'reserve_bytes': self.get('reserve_gb') * 10**9}
+                'disk_free_bytes': disk.free, 'reserve_bytes': self.get('reserve_gb') * 10**9, 'recordings_root':str(self.recordings_root),
+                'saved_bytes':sum(p.stat().st_size for p in self.recordings_root.glob('*/Saves/*.mp4') if p.exists())}
 
     def prune(self):
+        with self.lock:return self._prune_locked()
+
+    def _prune_locked(self):
         """Delete indexed, completed segments only. Never touch the live ring or active files."""
         info = self.storage()
         used, free = info['used_bytes'], info['disk_free_bytes']
@@ -112,14 +159,14 @@ class Store:
                 break
             row = oldest[0]
             path = self.archive_path(row)
-            size = path.stat().st_size if path.exists() else 0
+            size = path.stat().st_size if path.exists() and path.stat().st_nlink==1 else 0
             path.unlink(missing_ok=True)
             self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
             used -= row['size']
             free += size
             if not self.rows('SELECT id FROM segments WHERE camera_id=? AND session=? LIMIT 1',
                              (row['camera_id'], row['session'])):
-                init = path.parent / 'init.mp4'
+                init = path.parent / 'init.mp4' if not row.get('relative_path') else path.parent / '.no-init-file'
                 if init.exists():
                     size = init.stat().st_size
                     init.unlink()
@@ -137,6 +184,9 @@ class Store:
         for row in self.rows('SELECT * FROM segments'):
             if not self.archive_path(row).exists():
                 self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
+        for p in self.recordings_root.glob('*/*.mp4'):
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}_.+_seg_\d+\.mp4',p.name) and p not in known:
+                p.unlink(missing_ok=True)
         for p in (self.root / 'archive').glob('*/*/*'):
             if p.suffix == '.tmp' or (p.suffix == '.m4s' and p not in known):
                 p.unlink(missing_ok=True)
@@ -160,7 +210,7 @@ def rtsp_timeout(binary, microseconds):
     return [option, str(microseconds)]
 
 
-def hls_output(folder, compatible=False, codec=None):
+def hls_output(folder, compatible=False, codec=None, manifest="index.m3u8"):
     """FFmpeg HLS with atomic, finalized fMP4 segments. Video is copied unless opted in."""
     video = ['-c:v', 'copy'] + (['-tag:v', 'hvc1'] if codec == 'hevc' else [])
     if compatible:
@@ -170,7 +220,7 @@ def hls_output(folder, compatible=False, codec=None):
             '-f', 'hls', '-hls_time', '4', '-hls_list_size', '10', '-hls_delete_threshold', '6',
             '-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4',
             '-hls_flags', 'delete_segments+temp_file+program_date_time+independent_segments',
-            '-hls_segment_filename', str(folder / 'seg_%09d.m4s'), str(folder / 'index.m3u8')]
+            '-hls_segment_filename', str(folder / 'seg_%09d.m4s'), str(folder / manifest)]
 
 
 def playlist_entries(path):
@@ -207,6 +257,9 @@ class Worker:
         self.last_segment = 0
         self.seen = set()
         self.warning = None
+        self.timing_source = "waiting-camera-rtcp"
+        self.latest_capture = None
+        self.audio_warning = None
 
     def start(self):
         # Probe closes before streaming starts; do not consume a second permanent camera slot.
@@ -236,50 +289,94 @@ class Worker:
             return
         self.probe = None
         # Do not persist FFmpeg stderr: it can contain credential-bearing input URLs.
-        self.process = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
-            '-rtsp_transport', 'tcp', *rtsp_timeout('ffmpeg', 15000000), '-fflags', '+genpts+discardcorrupt',
-            '-i', rtsp_url(self.camera), *hls_output(self.folder, codec=self.codec)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.process = subprocess.Popen([sys.executable,str(Path(__file__).with_name('capture.py'))],
+            stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,text=True)
+        self.process.stdin.write(json.dumps({'url':rtsp_url(self.camera),'folder':str(self.folder)}))
+        self.process.stdin.close()
         self.started = time.time()
 
     def ingest(self):
-        entries = playlist_entries(self.folder / 'index.m3u8')
-        for name, start, duration in entries:
-            path = self.folder / name
-            if path.exists():
-                self.last_segment = max(self.last_segment, path.stat().st_mtime)
-            if name in self.seen:
+        from media_time import first_video_pts
+        raw=self.folder/'raw.m3u8'
+        # Test/legacy fixtures can still expose an index manifest directly.
+        source=raw if raw.exists() else self.folder/'index.m3u8'
+        entries=playlist_entries(source)
+        timing=None
+        try:timing=json.loads((self.folder/'timing.json').read_text())
+        except (OSError,ValueError):pass
+        self.audio_warning=(timing or {}).get('audio_warning')
+        calibrated=[]
+        init=(self.folder/'init.mp4').read_bytes() if entries else b''
+        for name,start,duration in entries:
+            path=self.folder/name
+            if not path.exists():continue
+            self.last_segment=max(self.last_segment,path.stat().st_mtime)
+            if timing and timing.get('source')=='camera-rtcp':
+                start=timing['pts_to_utc']+first_video_pts(init,path.read_bytes())
+                self.timing_source='camera-rtcp'
+                self.latest_capture=start+duration
+            calibrated.append((name,start,duration))
+        if raw.exists():
+            # Publish a separate live manifest, so a raw server-time manifest never overwrites it.
+            starts={name:start for name,start,_ in calibrated}
+            lines=raw.read_text().splitlines();published=[];pending=None
+            for line in lines:
+                if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):continue
+                if line and not line.startswith('#') and line in starts and self.timing_source=='camera-rtcp':
+                    published.append('#EXT-X-PROGRAM-DATE-TIME:'+datetime.fromtimestamp(starts[line],timezone.utc).isoformat())
+                published.append(line)
+            temp=self.folder/'index.tmp';temp.write_text('\n'.join(published)+'\n');temp.replace(self.folder/'index.m3u8')
+        for name,start,duration in calibrated:
+            path=self.folder/name
+            if name in self.seen:continue
+            camera=self.store.camera(self.camera['id'])
+            if not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
+                self.seen.add(name);continue
+            if self.timing_source!='camera-rtcp':
+                self.warning='Waiting for camera RTCP capture timestamps. Live view works; recording waits for verified camera time.'
                 continue
-            with self.store.lock:
-                recording = self.store.get('recording')
-                since = self.store.get('record_since')
-            if not recording or start + duration <= since:
-                self.seen.add(name)
-                continue
-            target = self.store.root / 'archive' / self.camera['id'] / self.session
-            target.mkdir(parents=True, exist_ok=True)
-            if not (target / 'init.mp4').exists():
-                shutil.copyfile(self.folder / 'init.mp4', target / 'init.tmp')
-                (target / 'init.tmp').replace(target / 'init.mp4')
+            day=datetime.fromtimestamp(start,ZoneInfo(self.store.get('timezone')))
+            target=self.store.camera_folder(camera['id'])
+            target.mkdir(parents=True,exist_ok=True)
+            filename=day.strftime('%Y-%m-%d_%H-%M-%S%z')+'_'+self.session+'_'+name.replace('.m4s','.mp4')
+            output=target/filename;temp=output.with_suffix('.tmp')
             try:
-                shutil.copyfile(path, target / (name + '.tmp'))
+                with temp.open('wb') as handle:
+                    handle.write(init)
+                    with path.open('rb') as fragment:shutil.copyfileobj(fragment,handle)
+                temp.replace(output)
             except FileNotFoundError:
-                self.warning = 'A source segment expired before it could be archived.'
-                continue
-            (target / (name + '.tmp')).replace(target / name)
-            size = (target / name).stat().st_size
-            self.store.execute('INSERT OR IGNORE INTO segments(camera_id,session,name,start,duration,size) VALUES(?,?,?,?,?,?)',
-                               (self.camera['id'], self.session, name, start, duration, size))
+                temp.unlink(missing_ok=True);self.warning='A live segment expired before archiving.';continue
+            relative=output.relative_to(self.store.recordings_root).as_posix()
+            self.store.execute('INSERT OR IGNORE INTO segments(camera_id,session,name,start,duration,size,relative_path,init_size,timing_source) VALUES(?,?,?,?,?,?,?,?,?)',
+                (camera['id'],self.session,name,start,duration,output.stat().st_size,relative,len(init),'camera-rtcp'))
             self.seen.add(name)
+            self.warning=None
+        entries=calibrated
         # Keep memory bounded during long-running camera sessions.
         self.seen.intersection_update({e[0] for e in entries})
         if self.camera['compatible'] and entries and self.transcoder is None:
             target = self.folder / 'compatible'
             target.mkdir(exist_ok=True)
             self.transcoder = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
-                '-live_start_index', '-3', '-allowed_extensions', 'ALL', '-i', str(self.folder / 'index.m3u8'),
-                *hls_output(target, compatible=True)], stdin=subprocess.DEVNULL,
+                '-copyts','-avoid_negative_ts','disabled','-live_start_index', '-3', '-allowed_extensions', 'ALL', '-i', str(self.folder / 'index.m3u8'),
+                *hls_output(target, compatible=True,manifest='raw.m3u8')], stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        compatible_folder=self.folder/'compatible'
+        compatible_raw=compatible_folder/'raw.m3u8'
+        if compatible_raw.exists():
+            content=compatible_raw.read_text().splitlines();published=[]
+            mapping={}
+            if timing and timing.get('source')=='camera-rtcp':
+                compatible_init=(compatible_folder/'init.mp4').read_bytes()
+                for filename,_,_ in playlist_entries(compatible_raw):
+                    fragment=compatible_folder/filename
+                    if fragment.exists():mapping[filename]=timing['pts_to_utc']+first_video_pts(compatible_init,fragment.read_bytes())
+            for line in content:
+                if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):continue
+                if line in mapping:published.append('#EXT-X-PROGRAM-DATE-TIME:'+datetime.fromtimestamp(mapping[line],timezone.utc).isoformat())
+                published.append(line)
+            temp=compatible_folder/'index.tmp';temp.write_text('\n'.join(published)+'\n');temp.replace(compatible_folder/'index.m3u8')
         if self.transcoder is not None and self.transcoder.poll() is not None:
             self.transcoder = None
             self.warning = 'Compatible live conversion restarted. Original recording is unaffected.'
@@ -315,7 +412,7 @@ class Worker:
         return {'online': online, 'state': 'online' if online else ('connecting' if time.time()-self.started<35 else 'reconnecting'),
                 'live_url': '/media/live/' + relative + '/index.m3u8' if original.exists() else None,
                 'compatible_url': '/media/live/' + relative + '/compatible/index.m3u8' if compatible.exists() else None,
-                'warning': self.warning, 'session': self.session, 'codec': self.codec, 'resolution': self.resolution}
+                'warning': self.warning, 'session': self.session, 'codec': self.codec, 'resolution': self.resolution, 'timing_source':self.timing_source, 'latest_capture':self.latest_capture, 'audio_warning':self.audio_warning}
 
 
 class Engine:
@@ -353,7 +450,7 @@ class Engine:
                 with self.lock:
                     for cid in list(self.workers):
                         worker = self.workers[cid]
-                        if cid not in cameras or worker.camera != cameras[cid]:
+                        if cid not in cameras or any(worker.camera.get(k)!=cameras[cid].get(k) for k in ('host','port','username','password','path','compatible','enabled')):
                             worker.stop()
                             del self.workers[cid]
                     for cid, camera in cameras.items():

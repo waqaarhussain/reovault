@@ -54,7 +54,7 @@ def test_auth_and_csrf(app_module,client):
     del client.headers['X-CSRF-Token']
     assert client.post('/api/recording',json={'enabled':True}).status_code==403
     client.headers.update(headers)
-    assert client.post('/api/recording',json={'enabled':True}).status_code==200
+    assert client.post('/api/recording',json={'enabled':True}).status_code==405
     assert client.post('/api/control',json={'action':'start'},headers={'X-Control-Token':'wrong'}).status_code==403
     assert client.post('/api/logout').status_code==200
     assert client.get('/api/status').status_code==401
@@ -128,20 +128,22 @@ def test_oldest_rotation_and_restart_recovery(tmp_path):
     store.reconcile()
     assert not store.rows('SELECT * FROM segments')
     assert not list((store.root/'archive').glob('*/*/*.m4s'))
-    store.record(True)
-    since=store.get('record_since')
-    store.record(True)
-    assert store.get('record_since')==since
+    store.execute("INSERT INTO cameras(id,name,host,port,username,password,path) VALUES('cam','Camera','test',554,'u','p','/test')")
+    store.record('cam',True)
+    since=store.camera('cam')['record_since']
+    store.record('cam',True)
+    assert store.camera('cam')['record_since']==since
     store.db.close()
     restarted=Store(tmp_path/'data')
-    assert restarted.get('recording') is True
+    assert restarted.camera('cam')['record_enabled']==1
     restarted.db.close()
 
 
 @pytest.mark.parametrize('codec',['h264','hevc'])
 def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     store=Store(tmp_path/'data')
-    camera={'id':'camera','name':'Test','compatible':False}
+    store.execute("INSERT INTO cameras(id,name,host,port,username,password,path) VALUES('camera','Test','test',554,'u','p','/test')")
+    camera=store.camera('camera')
     worker=Worker(store,camera)
     encoder=['-c:v','libx264','-preset','ultrafast','-g','40'] if codec=='h264' else ['-c:v','libx265','-preset','ultrafast','-x265-params','pools=1:keyint=40:min-keyint=40']
     source=tmp_path/'source.mp4'
@@ -155,8 +157,15 @@ def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     worker.ingest()
     assert not store.rows('SELECT * FROM segments'),'Recording must be off initially'
     worker.seen.clear()
-    store.record(True)
-    store.set('record_since',entries[0][1])
+    from media_time import first_video_pts
+    import time
+    store.record('camera',True)
+    store.execute("UPDATE cameras SET record_since=0 WHERE id='camera'")
+    worker.ingest()
+    assert not store.rows('SELECT * FROM segments'),'An enabled camera must wait for source timestamps'
+    assert 'Waiting for camera RTCP' in worker.warning
+    first_pts=first_video_pts((worker.folder/'init.mp4').read_bytes(),(worker.folder/entries[0][0]).read_bytes())
+    (worker.folder/'timing.json').write_text(json.dumps({'source':'camera-rtcp','pts_to_utc':entries[0][1]-first_pts,'updated':time.time()}))
     worker.ingest()
     rows=store.rows('SELECT * FROM segments ORDER BY start')
     assert len(rows)==3
@@ -164,14 +173,33 @@ def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     assert len(store.rows('SELECT * FROM segments'))==3,'Repeated polling must not duplicate recordings'
     for row in rows:
         path=store.archive_path(row)
-        assert path.read_bytes()==(worker.folder/row['name']).read_bytes()
+        assert path.read_bytes()[row['init_size']:]==(worker.folder/row['name']).read_bytes()
     standalone=tmp_path/'download.mp4'
-    standalone.write_bytes((store.archive_path(rows[1]).parent/'init.mp4').read_bytes()+store.archive_path(rows[1]).read_bytes())
+    standalone.write_bytes(store.archive_path(rows[1]).read_bytes())
     subprocess.run(['ffmpeg','-v','error','-i',str(standalone),'-f','null','-'],check=True,timeout=15)
     details=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','stream=codec_name,codec_tag_string','-of','json',str(standalone)]))
     assert details['streams'][0]['codec_name']==codec
     if codec=='hevc':
         assert details['streams'][0]['codec_tag_string']=='hvc1'
+    from exporter import Exports
+    exports=Exports(store)
+    start=rows[0]['start']+1
+    end=rows[-1]['start']+rows[-1]['duration']-.5
+    job={'id':'testexport','status':'preparing'}
+    exports.export(store.camera('camera'),start,end,job)
+    assert job['status']=='complete'
+    saved=Path(job['path'])
+    assert saved.parent.name=='Saves'
+    assert saved.parent.parent.name=='Test'
+    subprocess.run(['ffmpeg','-v','error','-i',str(saved),'-f','null','-'],check=True,timeout=20)
+    exported=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration:stream=codec_name','-of','json',str(saved)]))
+    assert exported['streams'][0]['codec_name']==codec
+    assert 9<=float(exported['format']['duration'])<=14,exported
+    metadata=json.loads(saved.with_suffix('.json').read_text())
+    assert metadata['video_reencoded'] is False and metadata['source_timing']==['camera-rtcp']
+    # A manually saved clip survives removal of all continuous footage.
+    store.set('quota_gb',0);store.set('reserve_gb',0);store.prune()
+    assert saved.exists()
     store.db.close()
 
 
@@ -184,3 +212,27 @@ def test_ubuntu_ffmpeg_timeout_option(monkeypatch):
     monkeypatch.setattr(core.subprocess,'check_output',lambda *a,**kw:b'  -timeout <int64> socket I/O timeout\n')
     assert core.rtsp_timeout('ffmpeg',15000000)==['-timeout','15000000']
     core.rtsp_timeout.cache_clear()
+
+
+def test_device_names_and_local_helper_do_not_enable_future_cameras(app_module,client,monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app_module,'discover',lambda c:{'name':'Camera supplied name','clock_offset':0.2,'checked':time.time()})
+    body={'name':'','host':'home.eero.online','port':8551,'onvif_port':8851,'username':'admin','password':'test','path':'/Preview_01_main'}
+    result=client.post('/api/cameras',json=body)
+    assert result.status_code==200,result.text
+    first=result.json()['id']
+    assert app_module.STORE.camera(first)['name']=='Camera supplied name'
+    assert app_module.STORE.camera(first)['device_name']=='Camera supplied name'
+    assert app_module.STORE.camera(first)['record_enabled']==0
+    helper=TestClient(app_module.app,client=('127.0.0.1',12345))
+    headers={'X-Control-Token':'private-control'}
+    assert helper.post('/api/control',headers=headers,json={'action':'start','camera_id':first}).status_code==200
+    monkeypatch.setattr(app_module,'discover',lambda c:{'name':'Second camera','clock_offset':0.1,'checked':time.time()})
+    second=client.post('/api/cameras',json={**body,'port':8552,'onvif_port':8852}).json()['id']
+    assert app_module.STORE.camera(first)['record_enabled']==1
+    assert app_module.STORE.camera(second)['record_enabled']==0
+    assert helper.post('/api/control',headers=headers,json={'action':'start','camera_id':second}).status_code==200
+    assert helper.post('/api/control',headers=headers,json={'action':'stop','camera_id':first}).status_code==200
+    assert app_module.STORE.camera(first)['record_enabled']==0
+    assert app_module.STORE.camera(second)['record_enabled']==1
+    helper.close()

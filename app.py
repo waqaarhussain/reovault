@@ -15,12 +15,15 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from starlette.concurrency import run_in_threadpool
 
 from core import Store, Engine, password_hash
+from device import discover
+from exporter import Exports
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get('REOVAULT_CONFIG', '/etc/reovault/config.json'))
 SETTINGS = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 STORE = Store(os.environ.get('REOVAULT_DATA', '/var/lib/reovault'))
 ENGINE = Engine(STORE)
+EXPORTS = Exports(STORE)
 FAILURES = defaultdict(list)
 
 
@@ -139,7 +142,7 @@ def status(request: Request):
         c.update(statuses.get(c['id'], {'online': False, 'state': 'disabled' if not c['enabled'] else 'connecting',
                                        'live_url': None, 'compatible_url': None, 'session': None}))
         cameras.append(c)
-    return {'cameras': cameras, 'recording': STORE.get('recording'), 'storage': STORE.storage(),
+    return {'cameras': cameras, 'recording':any(c['record_enabled'] for c in cameras), 'timezone':STORE.get('timezone'), 'storage': STORE.storage(),
             'engine_warning': ENGINE.error, 'csrf': csrf(request.cookies.get('reovault_session', '')),
             'username': SETTINGS.get('username', 'admin'), 'server_time': time.time()}
 
@@ -165,9 +168,12 @@ def clean_camera(body, existing=None):
     username = str(body.get('username', existing.get('username', 'admin')))
     password = str(body.get('password') or existing.get('password', ''))
     try:
+        onvif_port=int(body.get('onvif_port',existing.get('onvif_port',0)) or 0)
+        if not 0<=onvif_port<=65535:raise ValueError()
         port = int(body.get('port', existing.get('port', 554)))
     except (ValueError, TypeError):
         raise HTTPException(400, 'Port must be a number')
+    if not name and onvif_port:name='Camera awaiting device name'
     if not name or len(name)>60:
         raise HTTPException(400, 'Enter a camera name, up to 60 characters.')
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', host):
@@ -181,18 +187,33 @@ def clean_camera(body, existing=None):
     return {'id': existing.get('id', uuid_hex()), 'name': name, 'host': host, 'port': port,
             'username': username, 'password': password, 'path': path,
             'enabled': int(bool(body.get('enabled', existing.get('enabled', True)))),
-            'compatible': int(bool(body.get('compatible', existing.get('compatible', False))))}
+            'compatible': int(bool(body.get('compatible', existing.get('compatible', False)))),
+            'onvif_port':onvif_port}
 
 
 def uuid_hex():
     return secrets.token_hex(8)
 
 
+@app.post('/api/camera-name')
+async def camera_name(request:Request):
+    body=await small_json(request)
+    old=STORE.camera(str(body.get('id',''))) or {}
+    c=clean_camera(body,old)
+    try:return await run_in_threadpool(discover,c)
+    except Exception:raise HTTPException(400,'Cannot read the camera name. Check the forwarded ONVIF port and device credentials.')
+
+
 @app.post('/api/cameras')
-async def add_camera(request: Request):
-    c = clean_camera(await small_json(request))
-    STORE.execute('INSERT INTO cameras(id,name,host,port,username,password,path,enabled,compatible) VALUES(?,?,?,?,?,?,?,?,?)', tuple(c.values()))
-    return {'ok': True, 'id': c['id']}
+async def add_camera(request:Request):
+    c=clean_camera(await small_json(request))
+    device=None
+    if c['onvif_port']:
+        try:device=await run_in_threadpool(discover,c);c['name']=device['name']
+        except Exception:raise HTTPException(400,'Cannot read the camera name. Check its ONVIF port, or enter a manual name and leave ONVIF blank.')
+    STORE.execute('INSERT INTO cameras(id,name,host,port,username,password,path,enabled,compatible,onvif_port) VALUES(?,?,?,?,?,?,?,?,?,?)',tuple(c.values()))
+    if device:STORE.execute('UPDATE cameras SET device_name=?,clock_offset=? WHERE id=?',(device['name'],device['clock_offset'],c['id']))
+    return {'ok':True,'id':c['id'],'record_enabled':False}
 
 
 @app.put('/api/cameras/{cid}')
@@ -201,25 +222,27 @@ async def edit_camera(cid: str, request: Request):
     if not old or old['deleted']:
         raise HTTPException(404)
     c = clean_camera(await small_json(request), old)
-    STORE.execute('UPDATE cameras SET name=?,host=?,port=?,username=?,password=?,path=?,enabled=?,compatible=? WHERE id=?',
-                  tuple(c[k] for k in ('name','host','port','username','password','path','enabled','compatible','id')))
+    if c['onvif_port']:
+        try:
+            device=await run_in_threadpool(discover,c);c['name']=device['name']
+            STORE.execute('UPDATE cameras SET device_name=?,clock_offset=? WHERE id=?',(device['name'],device['clock_offset'],cid))
+        except Exception:raise HTTPException(400,'Cannot read the camera name. Check its ONVIF port, or leave it blank to use a manual name.')
+    if not c['onvif_port']:STORE.execute('UPDATE cameras SET device_name=NULL,clock_offset=NULL WHERE id=?',(cid,))
+    STORE.execute('UPDATE cameras SET name=?,host=?,port=?,username=?,password=?,path=?,enabled=?,compatible=?,onvif_port=? WHERE id=?',
+                  tuple(c[k] for k in ('name','host','port','username','password','path','enabled','compatible','onvif_port','id')))
     return {'ok': True}
 
 
 @app.delete('/api/cameras/{cid}')
 def remove_camera(cid: str):
     # Preserve recordings and camera metadata for playback until retention removes them.
-    STORE.execute('UPDATE cameras SET deleted=1,enabled=0,password="" WHERE id=?', (cid,))
+    STORE.execute('UPDATE cameras SET deleted=1,enabled=0,record_enabled=0,password="" WHERE id=?', (cid,))
     return {'ok': True}
 
 
 @app.post('/api/recording')
-async def recording(request: Request):
-    body = await small_json(request)
-    if not isinstance(body.get('enabled'), bool):
-        raise HTTPException(400)
-    STORE.record(body['enabled'])
-    return {'recording': STORE.get('recording')}
+def recording():
+    raise HTTPException(405,'Recording is controlled per camera with the local record helper.')
 
 
 @app.post('/api/storage')
@@ -243,11 +266,20 @@ async def control(request: Request):
     if request.client.host not in ('127.0.0.1', '::1') or not hmac.compare_digest(key, SETTINGS.get('control_token', '')):
         raise HTTPException(403)
     body = await small_json(request)
-    if body.get('action') in ('start', 'stop'):
-        STORE.record(body['action']=='start')
-    elif body.get('action') != 'status':
-        raise HTTPException(400)
-    return {'recording': STORE.get('recording'), 'cameras': len(STORE.cameras()), 'storage': STORE.storage()}
+    action=body.get('action');cid=str(body.get('camera_id',''))
+    if action in ('start','stop'):
+        try:STORE.record(cid,action=='start')
+        except ValueError as e:raise HTTPException(400,str(e))
+    elif action=='export':
+        try:return EXPORTS.start(cid,float(body['start']),float(body['end']))
+        except (ValueError,KeyError,TypeError) as e:raise HTTPException(400,str(e))
+    elif action=='export-status':
+        job=EXPORTS.jobs.get(str(body.get('job_id','')))
+        if not job:raise HTTPException(404,'Export status was lost after a server restart. Run download again.')
+        return dict(job)
+    elif action not in ('status','list'):raise HTTPException(400)
+    cameras=[{k:c[k] for k in ('id','name','device_name','record_enabled','onvif_port','clock_offset')} for c in STORE.cameras(bool(body.get('include_deleted')))]
+    return {'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses()}
 
 
 def safe_path(base, relative):
@@ -302,41 +334,58 @@ def playback(cid: str, start: float, end: float):
         if session != previous or (previous_end is not None and row['start']-previous_end>1):
             if previous is not None:
                 lines.append('#EXT-X-DISCONTINUITY')
-            lines.append(f'#EXT-X-MAP:URI="/media/archive/{cid}/{session}/init.mp4"')
+            lines.append(f'#EXT-X-MAP:URI="/api/inits/{cid}/{session}.mp4"')
         stamp = datetime.fromtimestamp(row['start'],timezone.utc).isoformat()
-        lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", f"/media/archive/{cid}/{session}/{row['name']}"]
+        lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", f"/api/fragments/{row['id']}.m4s"]
         previous, previous_end = session, row['start']+row['duration']
     lines.append('#EXT-X-ENDLIST')
     return PlainTextResponse('\n'.join(lines)+'\n', media_type='application/vnd.apple.mpegurl')
 
 
+@app.get('/api/inits/{cid}/{session}.mp4')
+def initialization(cid:str,session:str):
+    rows=STORE.rows('SELECT * FROM segments WHERE camera_id=? AND session=? ORDER BY start LIMIT 1',(cid,session))
+    if not rows:raise HTTPException(404)
+    try:data=STORE.initialization(rows[0])
+    except OSError:raise HTTPException(404)
+    return StreamingResponse(iter([data]),media_type='video/mp4')
+
+
+@app.get('/api/fragments/{sid}.m4s')
+def fragment(sid:int):
+    rows=STORE.rows('SELECT * FROM segments WHERE id=?',(sid,))
+    if not rows:raise HTTPException(404)
+    row=rows[0]
+    try:handle=STORE.archive_path(row).open('rb');handle.seek(row['init_size'])
+    except OSError:raise HTTPException(404)
+    def stream():
+        try:
+            while block:=handle.read(1024*1024):yield block
+        finally:handle.close()
+    return StreamingResponse(stream(),media_type='video/mp4')
+
+
 @app.get('/api/download/{sid}')
-def download(sid: int):
-    rows = STORE.rows('SELECT * FROM segments WHERE id=?', (sid,))
-    if not rows:
-        raise HTTPException(404, 'This recording has expired.')
-    row = rows[0]
-    path = STORE.archive_path(row)
-    try:
-        # Open before retention can unlink these files. Existing descriptors stay valid on Linux.
-        init = (path.parent / 'init.mp4').open('rb')
+def download(sid:int):
+    import shutil
+    rows=STORE.rows('SELECT * FROM segments WHERE id=?',(sid,))
+    if not rows:raise HTTPException(404,'This recording has expired.')
+    row=rows[0]
+    saves=STORE.camera_folder(row['camera_id'])/'Saves';saves.mkdir(exist_ok=True)
+    stamp=datetime.fromtimestamp(row['start'],timezone.utc).strftime('%Y-%m-%d_%H-%M-%SZ')
+    output=saves/(stamp+'_'+str(sid)+'_original.mp4')
+    with STORE.lock:
         try:
-            fragment = path.open('rb')
-        except OSError:
-            init.close()
-            raise
-    except OSError:
-        raise HTTPException(404, 'This recording has expired.')
-    def chunks():
-        try:
-            for handle in (init, fragment):
-                while block := handle.read(1024*1024):
-                    yield block
-        finally:
-            init.close()
-            fragment.close()
-    stamp = datetime.fromtimestamp(row['start'],timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    return StreamingResponse(chunks(), media_type='video/mp4', headers={'Content-Disposition':f'attachment; filename="{row["camera_id"]}_{stamp}.mp4"'})
+            if not output.exists():
+                if shutil.disk_usage(saves).free<row['size']+STORE.get('reserve_gb')*1e9:raise HTTPException(507,'Not enough free space to save this clip.')
+                temp=output.with_suffix('.tmp')
+                with temp.open('wb') as handle:
+                    if not row['init_size']:handle.write(STORE.initialization(row))
+                    with STORE.archive_path(row).open('rb') as source:shutil.copyfileobj(source,handle)
+                temp.replace(output)
+        except OSError:raise HTTPException(404,'The recording expired or could not be saved.')
+    return FileResponse(output,media_type='video/mp4',filename=output.name)
+
 
 @app.get('/api/timeline')
 def timeline(camera: str, start: float, end: float, bucket: int = 1800):

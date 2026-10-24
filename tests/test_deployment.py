@@ -87,7 +87,7 @@ def test_release_activation_and_rollback_preserve_runtime_data(tmp_path,fail_act
     # Existing unrelated updater must be preserved.
     unrelated=fs/'usr/local/bin/update-live';executable(unrelated,'#!/bin/sh\necho another-app\n')
     executable(bin_dir/'update-live','#!/bin/sh\necho another-app\n')
-    for name in ['apt-get','id','chown','systemctl','journalctl']:
+    for name in ['apt-get','id','chown','systemctl','journalctl','groupadd','usermod','getent']:
         executable(bin_dir/name,'#!/bin/sh\nexit 0\n')
     executable(bin_dir/'install','''#!/usr/bin/env python3
 import os,sys
@@ -116,11 +116,13 @@ if sys.argv[1:3]==['-m','venv']:
     for name in ('install',):
         p=bin_dir/name;p.write_text(p.read_text().replace('#!/usr/bin/env python3','#!/usr/bin/python3'))
     source=tmp_path/'source';source.mkdir()
-    for name in ['app.py','core.py','requirements.txt','manage.py','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
+    for name in ['app.py','core.py','capture.py','media_time.py','device.py','exporter.py','clip_input.py','requirements.txt','manage.py','bootstrap.sh','update-live.sh','static/vendor/hls.min.js']:
         p=source/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('placeholder')
+    (fs/'root').mkdir(exist_ok=True)
     script=scoped((ROOT/'install.sh').read_text())
-    for path in ['/opt/reovault','/etc/reovault','/var/lib/reovault','/etc/systemd/system/reovault.service','/usr/local/bin']:
-        script=script.replace(path,str(fs)+path)
+    import re
+    paths=['/opt/reovault','/etc/reovault','/var/lib/reovault','/etc/systemd/system/reovault.service','/usr/local/bin','/root/Reolink','/Reolink']
+    script=re.sub('|'.join(re.escape(x) for x in sorted(paths,key=len,reverse=True)),lambda m:str(fs)+m.group(),script)
     script_path=source/'install.sh';script_path.write_text(script)
     env={**os.environ,'PATH':str(bin_dir)+os.pathsep+os.environ['PATH'],
          'TEST_FAIL_ACTIVATION':'1' if fail_activation else '0','REOVAULT_REVISION':SHA}

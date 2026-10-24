@@ -15,7 +15,7 @@ if [[ "${1:-}" == --update && ! -f /etc/reovault/config.json ]]; then
   exit 1
 fi
 src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-for required in app.py core.py requirements.txt manage.py bootstrap.sh update-live.sh static/vendor/hls.min.js; do
+for required in app.py core.py capture.py media_time.py device.py exporter.py clip_input.py requirements.txt manage.py bootstrap.sh update-live.sh static/vendor/hls.min.js; do
   [[ -s "$src_dir/$required" ]] || { echo "Missing package file: $required" >&2; exit 1; }
 done
 revision="${REOVAULT_REVISION:-local}"
@@ -28,6 +28,10 @@ id reovault >/dev/null 2>&1 || useradd --system --home-dir /var/lib/reovault --s
 install -d -m 0755 /opt/reovault /opt/reovault/releases
 install -d -m 0750 -o reovault -g reovault /var/lib/reovault
 install -d -m 0750 -o root -g reovault /etc/reovault
+getent group reolink-media >/dev/null || groupadd --system reolink-media
+install -d -m 2750 -o reovault -g reolink-media /Reolink
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then usermod -a -G reolink-media "$SUDO_USER"; fi
+if [[ ! -e /root/Reolink && ! -L /root/Reolink ]]; then ln -s /Reolink /root/Reolink; fi
 release_dir="$(mktemp -d "/opt/reovault/releases/${revision:0:12}.XXXXXX")"
 chmod 0755 "$release_dir"
 backup_dir="$(mktemp -d /tmp/reovault-activate.XXXXXX)"
@@ -73,7 +77,7 @@ rsync -a --exclude='.git' --exclude='.venv' --exclude='venv' --exclude='__pycach
 python3 -m venv "$release_dir/venv"
 "$release_dir/venv/bin/pip" install --disable-pip-version-check -r "$release_dir/requirements.txt"
 "$release_dir/venv/bin/python" -m compileall -q "$release_dir/app.py" "$release_dir/core.py" "$release_dir/manage.py"
-"$release_dir/venv/bin/python" "$release_dir/manage.py" setup
+REOVAULT_RECORDINGS=/Reolink "$release_dir/venv/bin/python" "$release_dir/manage.py" setup
 chown root:reovault /etc/reovault/config.json
 chmod 0640 /etc/reovault/config.json
 # Initial setup creates the DB as root. Existing video trees are never recursively changed.
@@ -88,23 +92,25 @@ Wants=network-online.target
 [Service]
 User=reovault
 Group=reovault
+SupplementaryGroups=reolink-media
 WorkingDirectory=/opt/reovault/current
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=REOVAULT_CONFIG=/etc/reovault/config.json
 Environment=REOVAULT_DATA=/var/lib/reovault
+Environment=REOVAULT_RECORDINGS=/Reolink
 ExecStart=/opt/reovault/current/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8765 --no-proxy-headers --no-access-log
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=90
 KillMode=mixed
-UMask=0077
+UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
-ReadWritePaths=/var/lib/reovault
+ReadWritePaths=/var/lib/reovault /Reolink
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 [Install]
 WantedBy=multi-user.target
@@ -135,7 +141,13 @@ cat > /usr/local/bin/record <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ ${EUID} -ne 0 ]]; then exec sudo /usr/local/bin/record "$@"; fi
-exec /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py "$@"
+exec env REOVAULT_RECORDINGS=/Reolink /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py "$@"
+WRAPPER
+cat > /usr/local/bin/download <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${EUID} -ne 0 ]]; then exec sudo /usr/local/bin/download "$@"; fi
+exec env REOVAULT_RECORDINGS=/Reolink /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py download
 WRAPPER
 cat > /usr/local/bin/reovault <<'WRAPPER'
 #!/usr/bin/env bash
@@ -153,7 +165,7 @@ case "${1:-status}" in
   *) echo 'Usage: reovault [status|restart|logs|password|update|version]' >&2; exit 1 ;;
 esac
 WRAPPER
-chmod 0755 /usr/local/bin/record /usr/local/bin/reovault
+chmod 0755 /usr/local/bin/record /usr/local/bin/download /usr/local/bin/reovault
 existing_updater="$(command -v update-live || true)"
 if [[ -z "$existing_updater" ]] || grep -qF '# reovault-update-live' "$existing_updater" 2>/dev/null; then
   install -m 0755 "$release_dir/update-live.sh" /usr/local/bin/update-live
@@ -174,12 +186,16 @@ Sign in with the dashboard credentials you chose, then add your cameras.
 Allow inbound TCP 8765 in your VPS/provider firewall if needed.
 No firewall rules were changed automatically.
 
-Start recording:   record
-Stop recording:    record stop
+Start one camera:  record "Camera Name"
+Stop one camera:   record stop "Camera Name"
+Export a clip:     download
 Recording status: record status
 Future updates:   update-live  (or reovault update)
 
-First installation starts in standby. Updates preserve recording state,
+Every newly added camera starts OFF. Recording files: /Reolink/Camera Name/.
+Saved clips: /Reolink/Camera Name/Saves/. Refresh Termius SFTP to see them.
+A root login also has /root/Reolink as a shortcut.
+Updates preserve existing per-camera recording state,
 cameras, credentials, storage settings and footage. The service restarts
 briefly after the new code is ready, so expect a short recording gap.
 Dashboard uses HTTP as requested; login and video traffic are not encrypted.
