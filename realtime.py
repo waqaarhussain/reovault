@@ -1,6 +1,7 @@
 """Private go2rtc control API; authenticated browser signalling is proxied by app.py."""
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -31,8 +32,18 @@ class Realtime:
             for camera in cameras.values():
                 source=(native_preview_camera(camera) if camera['compatible'] else None) or camera
                 name='camera_'+camera['id']
-                # Opus conversion is audio-only and starts on demand. Video is passed through.
-                streams[name]=[rtsp_url(source),'ffmpeg:'+name+'#audio=opus#raw=-ar:a 48000 -ac:a 2']
+                # A separate local source avoids converter recursion and shares one camera connection.
+                source_name=name+'_source'
+                streams[source_name]=[rtsp_url(source)]
+                local='rtsp://127.0.0.1:'+str(self.rtsp_port)+'/'+source_name
+                # go2rtc's ffmpeg: module rejects FFmpeg <5 (Ubuntu 22.04 ships 4.x).
+                # exec: uses an explicit command compatible with both 4.x and newer.
+                # Only loopback URLs reach argv; camera credentials stay in the private config.
+                audio=('exec:ffmpeg -nostdin -hide_banner -loglevel error -rtsp_transport tcp '
+                    '-i '+local+'?audio -map 0:a:0 -vn -c:a libopus -application lowdelay '
+                    '-ar 48000 -ac 2 -af aresample=async=1:first_pts=0 '
+                    '-rtsp_transport tcp -f rtsp {output}')
+                streams[name]=[local,audio]
             public=os.environ.get('REOVAULT_WEBRTC_IP') or self.store.get('webrtc_public_ip')
             config={'api':{'listen':'127.0.0.1:'+str(self.api_port)},
                 'rtsp':{'listen':'127.0.0.1:'+str(self.rtsp_port)},
@@ -76,6 +87,11 @@ class Realtime:
 
     def diagnostics(self):
         result=self.status();result['streams']={}
+        try:
+            version=subprocess.run(['ffmpeg','-version'],capture_output=True,text=True,timeout=3)
+            match=re.search(r'^ffmpeg version ([0-9][0-9A-Za-z.+:~_-]*)',version.stdout)
+            result['ffmpeg_version']=match.group(1) if match else 'unknown'
+        except (OSError,subprocess.TimeoutExpired):result['ffmpeg_version']='unavailable'
         if not result['available']:return result
         try:
             with urllib.request.urlopen(self.base+'/api/streams',timeout=2) as response:
@@ -91,7 +107,7 @@ class Realtime:
                         for track in peer.get(tracks,[]) or []:
                             codec=track.get('codec',{})
                             name=codec.get('codec_name') or codec.get('name')
-                            if name in ('H264','H265','HEVC','AAC','OPUS','PCMA','PCMU','h264','hevc','aac','opus'):
+                            if isinstance(name,str) and name.lower() in ('h264','h265','hevc','aac','opus','pcma','pcmu','mpeg4-generic'):
                                 codecs.append({'codec':name,**{k:track[k] for k in ('bytes','packets') if isinstance(track.get(k),(int,float))}})
                         summary[side].append({'tracks':codecs,**{k:peer[k] for k in ('recv','send') if isinstance(peer.get(k),(int,float))}})
                 result['streams'][camera['id']]=summary

@@ -22,8 +22,13 @@ def test_realtime_config_is_private_lazy_and_preserves_main_stream(tmp_path,monk
     config=rtc.folder/'go2rtc.json';data=json.loads(config.read_text())
     assert data['api']['listen']=='127.0.0.1:19844' and data['rtsp']['listen']=='127.0.0.1:18555'
     assert data['webrtc']['candidates']==['203.0.113.7:8555']
-    assert data['streams']['camera_a'][0].endswith('/Preview_01_sub')
-    assert data['streams']['camera_a'][1]=='ffmpeg:camera_a#audio=opus#raw=-ar:a 48000 -ac:a 2'
+    assert data['streams']['camera_a_source'][0].endswith('/Preview_01_sub')
+    assert data['streams']['camera_a'][0]=='rtsp://127.0.0.1:18555/camera_a_source'
+    audio=data['streams']['camera_a'][1]
+    assert audio.startswith('exec:ffmpeg ') and ' -vn ' in audio and '-c:a libopus' in audio
+    assert '-ar 48000 -ac 2' in audio and '{output}' in audio
+    assert 'private' not in audio and 'home.example' not in audio
+    assert '-timeout ' not in audio and '-c:v' not in audio
     assert camera['path']=='/Preview_01_main'
     assert config.stat().st_mode&0o777==0o600
     assert 'private' not in json.dumps(rtc.status())
