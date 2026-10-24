@@ -7,6 +7,7 @@ import struct
 import sys
 import time
 from pathlib import Path
+from fractions import Fraction
 
 from core import atomic_json, safe_error
 
@@ -48,6 +49,40 @@ class CaptureFailure(Exception):
     def __init__(self,detail):self.detail=detail
 
 
+def nearest_tick(value):
+    # Match FFmpeg's nearest rounding, including negative timestamps.
+    if value<0:return -nearest_tick(-value)
+    return (2*value.numerator+value.denominator)//(2*value.denominator)
+
+
+class AudioTimestampGuard:
+    """Repair small AAC timestamp backsteps while leaving encoded packets and video untouched."""
+    def __init__(self):
+        self.last={};self.repairs=0;self.max_adjustment=0.0
+
+    def prepare(self,packet):
+        if packet.stream.type!='audio' or packet.stream.codec_context.name!='aac' or packet.dts is None:return
+        rate=packet.stream.codec_context.sample_rate
+        if not rate or packet.time_base is None:return
+        index=packet.stream.index;old_base=packet.time_base;new_base=Fraction(1,rate)
+        # Validate in the output sample clock so rounding cannot reintroduce duplicate DTS.
+        dts=nearest_tick(packet.dts*old_base/new_base)
+        pts=nearest_tick(packet.pts*old_base/new_base) if packet.pts is not None else None
+        previous=self.last.get(index)
+        if previous is not None and dts<=previous:
+            correction=previous+1-dts
+            if Fraction(correction,rate)>Fraction(1,4):
+                raise CaptureFailure({'type':'AudioClockDiscontinuity','stage':'timestamp-validation',
+                    'stream_type':'audio','mux_reason':'audio-clock-jump','correction_seconds':correction/rate})
+            dts+=correction
+            if pts is not None:pts+=correction
+            self.repairs+=1;self.max_adjustment=max(self.max_adjustment,correction/rate)
+        self.last[index]=dts
+        packet.dts=dts;packet.pts=pts
+        packet.duration=nearest_tick(packet.duration*old_base/new_base)
+        packet.time_base=new_base
+
+
 def capture(url,folder,stop=None):
     import av
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
@@ -67,6 +102,7 @@ def capture(url,folder,stop=None):
     if video.codec_context.name=='hevc':streams[video.index].codec_context.codec_tag='hvc1'
     last_write=0;anchor=None;started=False
     packet_counts={};clock_flags={};previous_dts={};begin=time.monotonic()
+    audio_guard=AudioTimestampGuard()
     try:
         for packet in source.demux(selected):
             if stop is not None and stop():break
@@ -86,13 +122,15 @@ def capture(url,folder,stop=None):
                     anchor=candidate
                 if time.monotonic()-last_write>1:
                     atomic_json(folder/'timing.json',{'source':'camera-rtcp' if anchor is not None else 'waiting-camera-rtcp',
-                        'pts_to_utc':anchor,'updated':time.time(),'audio_warning':audio_warning,
+                        'pts_to_utc':anchor,'updated':time.time(),'audio_warning':audio_warning or ('AAC timestamp jitter repaired without re-encoding; video camera time is unchanged.' if audio_guard.repairs else None),
+                        'audio_timestamp_repairs':audio_guard.repairs,'audio_max_adjustment_seconds':audio_guard.max_adjustment,
                         'packet_counts':dict(packet_counts),'prft_flags':dict(clock_flags),'elapsed_seconds':round(time.monotonic()-begin,2)})
                     last_write=time.monotonic()
                 if not started:
                     if not packet.is_keyframe:continue
                     started=True
             if not started:continue
+            audio_guard.prepare(packet)
             context={'stage':'mux','stream_type':packet.stream.type,'codec':packet.stream.codec_context.name,
                 'pts':packet.pts,'dts':packet.dts,'previous_dts':previous_dts.get(index),
                 'time_base':str(packet.time_base),'duration':packet.duration,

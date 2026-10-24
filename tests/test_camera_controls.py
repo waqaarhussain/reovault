@@ -143,3 +143,80 @@ def test_real_aac_timestamp_regression_produces_specific_mux_diagnostic(tmp_path
                 assert failure.value.detail['mux_reason']=='non-monotonic-timestamps'
             finally:output.close()
     finally:av.logging.set_level(original)
+
+
+@pytest.mark.parametrize('backstep',[0,8])
+def test_repaired_aac_packets_mux_and_decode_without_reencoding(tmp_path,backstep):
+    import av
+    import subprocess
+    from capture import AudioTimestampGuard
+    source=tmp_path/'source.m4a';target=tmp_path/'out.mp4'
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','sine=sample_rate=16000','-t','2','-c:a','aac',str(source)],check=True,timeout=15)
+    original_packets=[];previous=None;guard=AudioTimestampGuard()
+    with av.open(str(source)) as incoming:
+        output=av.open(str(target),'w');stream=output.add_stream_from_template(incoming.streams.audio[0])
+        try:
+            for i,packet in enumerate(incoming.demux(incoming.streams.audio[0])):
+                if packet.dts is None:continue
+                original_packets.append(bytes(packet))
+                raw=packet.dts
+                if i==15:packet.dts=previous-backstep;packet.pts=packet.dts
+                guard.prepare(packet);previous=raw
+                packet.stream=stream;output.mux(packet)
+        finally:output.close()
+    assert guard.repairs==1 and guard.max_adjustment==(backstep+1)/16000
+    with av.open(str(target)) as output:
+        packets=[bytes(p) for p in output.demux(audio=0) if p.size]
+    assert packets==original_packets,'Encoded AAC payloads must remain unchanged'
+    subprocess.run(['ffmpeg','-v','error','-i',str(target),'-f','null','-'],check=True,timeout=15)
+
+
+def test_audio_guard_leaves_video_camera_timestamps_untouched_and_rejects_large_jump():
+    from types import SimpleNamespace
+    from capture import AudioTimestampGuard,CaptureFailure
+    guard=AudioTimestampGuard()
+    codec=SimpleNamespace(name='hevc',sample_rate=0)
+    video=SimpleNamespace(stream=SimpleNamespace(type='video',index=0,codec_context=codec),dts=100,pts=200,time_base=Fraction(1,90000),duration=3600)
+    before=vars(video).copy();guard.prepare(video)
+    assert vars(video)==before and guard.repairs==0
+    audio=SimpleNamespace(stream=SimpleNamespace(type='audio',index=1,codec_context=SimpleNamespace(name='aac',sample_rate=16000)),dts=16000,pts=16000,time_base=Fraction(1,16000),duration=1024)
+    guard.prepare(audio);audio.dts=0;audio.pts=0
+    with pytest.raises(CaptureFailure) as error:guard.prepare(audio)
+    assert error.value.detail['mux_reason']=='audio-clock-jump'
+
+
+@pytest.mark.parametrize('codec',['h264','hevc'])
+def test_capture_survives_duplicate_aac_with_original_video(tmp_path,monkeypatch,codec):
+    import av
+    import subprocess
+    import capture as module
+    source=tmp_path/'source.mp4';folder=tmp_path/'capture'
+    video=['-c:v','libx264','-preset','ultrafast','-g','20'] if codec=='h264' else ['-c:v','libx265','-preset','ultrafast','-x265-params','pools=1:keyint=20']
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=640x360:rate=10','-f','lavfi','-i','sine=sample_rate=16000','-t','5',*video,'-c:a','aac','-threads','2',str(source)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+    original_open=av.open;guards=[]
+    class Guard(module.AudioTimestampGuard):
+        def __init__(self):super().__init__();guards.append(self)
+    class JitterInput:
+        def __init__(self,container):self.container=container;self.streams=container.streams
+        def close(self):self.container.close()
+        def demux(self,selected):
+            previous=None;count=0
+            for packet in self.container.demux(selected):
+                if packet.stream.type=='audio' and packet.dts is not None:
+                    count+=1;raw=packet.dts
+                    if count in (15,45):packet.dts=previous;packet.pts=previous
+                    previous=raw
+                yield packet
+    def open_input(url,*args,**kwargs):
+        result=original_open(url,*args,**kwargs)
+        return JitterInput(result) if str(url)==str(source) else result
+    monkeypatch.setattr(av,'open',open_input);monkeypatch.setattr(module,'AudioTimestampGuard',Guard)
+    module.capture(str(source),folder)
+    assert guards[0].repairs==2
+    standalone=tmp_path/'joined.mp4'
+    standalone.write_bytes((folder/'init.mp4').read_bytes()+b''.join(p.read_bytes() for p in sorted(folder.glob('seg_*.m4s'))))
+    subprocess.run(['ffmpeg','-v','error','-i',str(standalone),'-f','null','-'],check=True,timeout=15)
+    with original_open(str(standalone)) as result:
+        assert result.streams.video[0].codec_context.name==codec
+        assert result.streams.video[0].codec_context.width==640
+        assert result.streams.audio[0].codec_context.name=='aac'

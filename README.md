@@ -91,7 +91,7 @@ No blank video is inserted into the gap, and missing footage is not fetched from
 
 ## Camera time, live time and export time
 
-RTSP ingestion uses PyAV with its bundled modern FFmpeg libraries. Encoded H.264/H.265 packets are remuxed without video re-encoding. AAC source audio is copied. If another source audio codec is encountered, the dashboard explicitly reports video-only capture for this version.
+RTSP ingestion uses PyAV with its bundled modern FFmpeg libraries. Encoded H.264/H.265 packets are remuxed without video re-encoding. AAC source audio is copied. Small duplicate/backward AAC timestamps are repaired by moving the affected audio packet to the next output audio-clock tick. Encoded audio/video payloads and video camera timestamps remain unchanged. The dashboard reports repairs. A correction exceeding a quarter-second triggers a new connection session rather than accumulating a large audio shift. If another source audio codec is encountered, the dashboard explicitly reports video-only capture for this version.
 
 The camera's **RTP/RTCP sender reference** supplies the mapping from video presentation timestamps to UTC. The recorder reads that reference, then reads the actual video sample presentation time in each MP4 fragment. The live manifest, stored index, timeline, playback, file names and range-export selection use that same mapping. It does not label server arrival time as camera capture time. The compatible H.264 live preview retains source timestamps and receives the same camera-time mapping; its conversion does not alter the original stored video.
 
