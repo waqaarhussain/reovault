@@ -169,6 +169,12 @@ def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     worker.ingest()
     rows=store.rows('SELECT * FROM segments ORDER BY start')
     assert len(rows)==3
+    # A preview may share camera credentials/id, but must never archive its lower-resolution stream.
+    preview=Worker(store,{**camera,'compatible':0},preview_only=True,folder=worker.folder/'preview'/'test')
+    for item in worker.folder.iterdir():
+        if item.is_file():shutil.copyfile(item,preview.folder/item.name)
+    preview.ingest()
+    assert len(store.rows('SELECT * FROM segments'))==3
     worker.ingest()
     assert len(store.rows('SELECT * FROM segments'))==3,'Repeated polling must not duplicate recordings'
     for row in rows:

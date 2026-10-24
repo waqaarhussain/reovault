@@ -128,7 +128,7 @@ def diagnose_command():
     print('Engine diagnostic: '+json.dumps(data.get('engine_diagnostic')))
     for c in data['cameras']:
         status=data['statuses'].get(c['id'],{})
-        print(c['name']+': '+json.dumps({k:status.get(k) for k in ('state','session','codec','resolution','timing_source','warning')}))
+        print(c['name']+': '+json.dumps({k:status.get(k) for k in ('state','session','codec','resolution','timing_source','warning','preview_method','preview')}))
         timings=sorted((DATA/'live'/c['id']).glob('*/timing.json'),key=lambda p:p.stat().st_mtime,reverse=True)
         if timings:
             try:print('Latest source timing: '+timings[0].read_text())

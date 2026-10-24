@@ -220,3 +220,17 @@ def test_capture_survives_duplicate_aac_with_original_video(tmp_path,monkeypatch
         assert result.streams.video[0].codec_context.name==codec
         assert result.streams.video[0].codec_context.width==640
         assert result.streams.audio[0].codec_context.name=='aac'
+
+
+def test_native_preview_path_preserves_credentials_channel_and_main_config(tmp_path):
+    from core import native_preview_camera,Worker
+    store=Store(tmp_path/'data');insert(store,'a','Driveway')
+    camera=store.camera('a');camera['path']='/Preview_02_main';camera['compatible']=1
+    sub=native_preview_camera(camera)
+    assert sub['path']=='/Preview_02_sub' and sub['compatible']==0
+    assert sub['username']==camera['username'] and sub['password']==camera['password'] and sub['port']==camera['port']
+    assert camera['path']=='/Preview_02_main' and camera['compatible']==1
+    assert native_preview_camera({**camera,'path':'/custom-stream'}) is None
+    worker=Worker(store,camera,preview_only=True,folder=tmp_path/'data/live/a/preview')
+    assert worker.preview_only and worker.folder.name=='preview'
+    store.db.close()

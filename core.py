@@ -239,6 +239,12 @@ def rtsp_url(camera):
     return f"rtsp://{auth}@{camera['host']}:{camera['port']}{camera['path']}"
 
 
+def native_preview_camera(camera):
+    # Read the existing camera encoder; never modify its stream settings.
+    if not re.fullmatch(r'/(?:h264)?Preview_\d{2}_main',camera['path'],re.IGNORECASE):return None
+    return {**camera,'path':camera['path'][:-4]+'sub','compatible':0}
+
+
 @lru_cache(maxsize=4)
 def rtsp_timeout(binary, microseconds):
     # Ubuntu 22.04 ships FFmpeg 4.4, whose socket option is named stimeout.
@@ -285,10 +291,12 @@ def playlist_entries(path):
 
 
 class Worker:
-    def __init__(self, store, camera):
+    def __init__(self, store, camera, preview_only=False, folder=None):
         self.store, self.camera = store, camera
+        self.preview_only=preview_only
+        self.preview_worker=None
         self.session = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
-        self.folder = store.root / 'live' / camera['id'] / self.session
+        self.folder = Path(folder) if folder is not None else store.root / 'live' / camera['id'] / self.session
         self.folder.mkdir(parents=True, exist_ok=True)
         self.process = None
         self.probe = None
@@ -333,6 +341,9 @@ class Worker:
             self.probe = None
             return
         self.probe = None
+        if self.preview_only and self.codec!='h264':
+            self.warning='The camera substream is not H.264; it cannot serve as the compatible preview. Original recording is unaffected.'
+            return
         # Do not persist FFmpeg stderr: it can contain credential-bearing input URLs.
         self.process = subprocess.Popen([sys.executable,str(Path(__file__).with_name('capture.py'))],
             stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,text=True)
@@ -375,7 +386,7 @@ class Worker:
             path=self.folder/name
             if name in self.seen:continue
             camera=self.store.camera(self.camera['id'])
-            if self.mode=='live' or not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
+            if self.preview_only or self.mode=='live' or not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
                 self.archive_key=None
                 self.seen.add(name);continue
             if self.timing_source!='camera-rtcp':
@@ -414,7 +425,8 @@ class Worker:
         entries=calibrated
         # Keep memory bounded during long-running camera sessions.
         self.seen.intersection_update({e[0] for e in entries})
-        if self.mode!='storage' and self.camera['compatible'] and entries and self.transcoder is None:
+        native=self.sync_native_preview()
+        if not native and self.mode!='storage' and self.camera['compatible'] and entries and self.transcoder is None:
             target = self.folder / 'compatible'
             target.mkdir(exist_ok=True)
             self.transcoder = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
@@ -440,7 +452,26 @@ class Worker:
             self.transcoder = None
             self.warning = 'Compatible live conversion restarted. Original recording is unaffected.'
 
+    def sync_native_preview(self):
+        if self.preview_only or not self.camera['compatible'] or self.mode=='storage':return False
+        camera=native_preview_camera(self.camera)
+        if camera is None:return False
+        worker=self.preview_worker
+        if worker is not None:
+            worker.poll_probe();worker.ingest()
+            dead=worker.probe is None and (worker.process is None or worker.process.poll() is not None)
+            stale=time.time()-max(worker.last_segment,worker.started)>45
+            if (dead and time.time()-worker.started>10) or stale:
+                worker.stop();self.preview_worker=None
+        if self.preview_worker is None:
+            folder=self.folder/'preview'/uuid.uuid4().hex[:8]
+            self.preview_worker=Worker(self.store,camera,preview_only=True,folder=folder)
+            self.preview_worker.start()
+        return True
+
     def stop(self):
+        if self.preview_worker is not None:
+            self.preview_worker.stop();self.preview_worker=None
         for proc in (self.probe, self.transcoder, self.process):
             if proc is not None and proc.poll() is None:
                 proc.terminate()
@@ -464,13 +495,15 @@ class Worker:
             self.camera['compatible'] = compatible
 
     def status(self):
+        preview=self.preview_worker.status() if self.preview_worker is not None else None
         original = self.folder / 'index.m3u8'
         compatible = self.folder / 'compatible' / 'index.m3u8'
         online = self.process is not None and self.process.poll() is None and time.time() - self.last_segment < 35
         relative = self.folder.relative_to(self.store.root / 'live').as_posix()
         return {'online': online, 'state': 'online' if online else ('connecting' if time.time()-self.started<35 else 'reconnecting'),
                 'live_url': '/media/live/' + relative + '/index.m3u8' if original.exists() and self.mode!='storage' else None,
-                'compatible_url': '/media/live/' + relative + '/compatible/index.m3u8' if compatible.exists() and self.mode!='storage' else None,
+                'compatible_url': preview['live_url'] if preview and preview['codec']=='h264' else ('/media/live/' + relative + '/compatible/index.m3u8' if compatible.exists() and self.mode!='storage' else None),
+                'preview':preview,'preview_method':'camera-substream' if preview else ('conversion' if self.transcoder is not None else None),
                 'warning': self.warning, 'session': self.session, 'codec': self.codec, 'resolution': self.resolution, 'timing_source':self.timing_source, 'latest_capture':self.latest_capture, 'audio_warning':self.audio_warning}
 
 

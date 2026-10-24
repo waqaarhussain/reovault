@@ -71,7 +71,7 @@ reovault mode both
 reovault mode status
 ```
 
-| Mode | Continuous storage | Live view | Compatible preview conversion |
+| Mode | Continuous storage | Live view | Compatible preview |
 | --- | --- | --- | --- |
 | `storage` | Cameras enabled with `record` | Disabled | Disabled |
 | `live` | Paused for every camera | Enabled | Only cameras configured for it |
@@ -79,7 +79,7 @@ reovault mode status
 
 Your camera recording switches are preserved when changing mode. Returning from live-only to storage/both resumes previously enabled cameras; new cameras remain off. `record` refuses to start archiving in live-only mode and tells you to change mode first. Use `record stop "Camera Name"` to clear a camera's saved choice. Mode changes may briefly restart camera connections. Previously stored footage stays available for playback/export in every mode.
 
-Storage-only still receives the original camera stream and uses a short disposable fragment buffer internally, but it does not serve live video or run the optional H.264 preview conversion. Cameras with recording off have no RTSP worker in that mode. Live-only keeps its disposable preview buffer without archiving it. Passing through original 4K video uses far less CPU than converting it; storage and network traffic still need enough capacity.
+Storage-only still receives the original camera stream and uses a short disposable fragment buffer internally, but it does not serve live video, connect a separate preview substream or run preview conversion. Cameras with recording off have no RTSP worker in that mode. Live-only keeps its disposable preview buffer without archiving it. Passing through original 4K video uses far less CPU than converting it; storage and network traffic still need enough capacity.
 
 ## Connection outages and hourly files
 
@@ -93,7 +93,7 @@ No blank video is inserted into the gap, and missing footage is not fetched from
 
 RTSP ingestion uses PyAV with its bundled modern FFmpeg libraries. Encoded H.264/H.265 packets are remuxed without video re-encoding. AAC source audio is copied. Small duplicate/backward AAC timestamps are repaired by moving the affected audio packet to the next output audio-clock tick. Encoded audio/video payloads and video camera timestamps remain unchanged. The dashboard reports repairs. A correction exceeding a quarter-second triggers a new connection session rather than accumulating a large audio shift. If another source audio codec is encountered, the dashboard explicitly reports video-only capture for this version.
 
-The camera's **RTP/RTCP sender reference** supplies the mapping from video presentation timestamps to UTC. The recorder reads that reference, then reads the actual video sample presentation time in each MP4 fragment. The live manifest, stored index, timeline, playback, file names and range-export selection use that same mapping. It does not label server arrival time as camera capture time. The compatible H.264 live preview retains source timestamps and receives the same camera-time mapping; its conversion does not alter the original stored video.
+The camera's **RTP/RTCP sender reference** supplies the mapping from video presentation timestamps to UTC. The recorder reads that reference, then reads the actual video sample presentation time in each MP4 fragment. The live manifest, stored index, timeline, playback, file names and range-export selection use that same mapping. It does not label server arrival time as camera capture time. For standard Reolink `Preview_XX_main` paths, compatible viewing reads `Preview_XX_sub` as a second camera connection and copies its H.264 video without conversion. It uses that substream’s own RTCP reference for the displayed preview time. Only the main stream can be archived or exported. Nonstandard RTSP paths retain the server-converted H.264 preview fallback, whose output is mapped to the main stream camera clock.
 
 The live tile displays the capture time of the frames actually being played, so a buffered live view is not labelled with the current page clock. Times are displayed in **Europe/London**, including daylight-saving changes. The helper uses the same timezone. The original camera's burned-in timestamp, if enabled on the device, remains part of the original picture.
 
@@ -162,7 +162,7 @@ reovault version
 update-live
 ```
 
-No existing NVR history is imported, no internet-outage gaps are recovered, and this version does not implement PTZ controls, event detection or notifications. Original HEVC playback depends on the viewing device. Compatible live viewing converts only the preview to H.264 up to 1080p; saved HEVC recordings still need a player that supports that codec.
+No existing NVR history is imported, no internet-outage gaps are recovered, and this version does not implement PTZ controls, event detection or notifications. Original HEVC playback depends on the viewing device. Compatible live viewing uses the camera’s existing H.264 substream for standard Reolink paths. The substream is lower resolution and can add camera upload traffic and another camera connection, but requires no VPS video conversion. A nonstandard path uses the original server-conversion fallback up to 1080p. Saved HEVC recordings still need a player that supports that codec. Chromium uses Hls.js for playback; Safari retains native HLS. This is still segmented HLS, so it adds buffering and is not promised to match the Reolink app’s latency. No camera settings are changed.
 
 ## Validation
 
