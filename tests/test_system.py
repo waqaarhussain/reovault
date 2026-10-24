@@ -165,7 +165,7 @@ def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     assert not store.rows('SELECT * FROM segments'),'An enabled camera must wait for source timestamps'
     assert 'Waiting for camera RTCP' in worker.warning
     first_pts=first_video_pts((worker.folder/'init.mp4').read_bytes(),(worker.folder/entries[0][0]).read_bytes())
-    (worker.folder/'timing.json').write_text(json.dumps({'source':'camera-rtcp','pts_to_utc':entries[0][1]-first_pts,'updated':time.time()}))
+    (worker.folder/'timing.json').write_text(json.dumps({'source':'camera-rtcp','pts_to_utc':1792857600+60-first_pts,'updated':time.time()}))
     worker.ingest()
     rows=store.rows('SELECT * FROM segments ORDER BY start')
     assert len(rows)==3
@@ -173,9 +173,11 @@ def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     assert len(store.rows('SELECT * FROM segments'))==3,'Repeated polling must not duplicate recordings'
     for row in rows:
         path=store.archive_path(row)
-        assert path.read_bytes()[row['init_size']:]==(worker.folder/row['name']).read_bytes()
+        assert store.fragment_bytes(row)==(worker.folder/row['name']).read_bytes()
     standalone=tmp_path/'download.mp4'
-    standalone.write_bytes(store.archive_path(rows[1]).read_bytes())
+    store.standalone(rows[1],standalone)
+    assert len({r['relative_path'] for r in rows})==1
+    subprocess.run(['ffmpeg','-v','error','-i',str(store.archive_path(rows[0])),'-f','null','-'],check=True,timeout=15)
     subprocess.run(['ffmpeg','-v','error','-i',str(standalone),'-f','null','-'],check=True,timeout=15)
     details=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','stream=codec_name,codec_tag_string','-of','json',str(standalone)]))
     assert details['streams'][0]['codec_name']==codec
@@ -236,3 +238,109 @@ def test_device_names_and_local_helper_do_not_enable_future_cameras(app_module,c
     assert app_module.STORE.camera(first)['record_enabled']==0
     assert app_module.STORE.camera(second)['record_enabled']==1
     helper.close()
+
+
+def test_mode_controls_preserve_camera_choices_and_block_live(app_module,client):
+    cid=add_camera(client);store=app_module.STORE
+    helper=TestClient(app_module.app,client=('127.0.0.1',12345))
+    headers={'X-Control-Token':'private-control'}
+    def control(**body):return helper.post('/api/control',headers=headers,json=body)
+    assert control(action='mode',mode='invalid').status_code==400
+    assert control(action='mode',mode='storage').status_code==200
+    assert not app_module.ENGINE.desired_cameras()
+    assert control(action='start',camera_id=cid).status_code==200
+    assert cid in app_module.ENGINE.desired_cameras()
+    assert client.get('/media/live/anything/index.m3u8').status_code==403
+    assert control(action='mode',mode='live').status_code==200
+    assert store.camera(cid)['record_enabled']==1
+    state=client.get('/api/status').json()
+    assert state['mode']=='live' and not state['recording'] and not state['cameras'][0]['record_active']
+    assert control(action='start',camera_id=cid).status_code==400
+    assert control(action='mode',mode='both').status_code==200
+    assert client.get('/api/status').json()['cameras'][0]['record_active']
+    second=add_camera(client)
+    assert not store.camera(second)['record_enabled']
+    helper.close()
+
+
+def test_hourly_files_reconnect_ranges_and_crash_tail(app_module,client,monkeypatch):
+    import media_time
+    from datetime import datetime
+    cid=add_camera(client);store=app_module.STORE
+    store.record(cid,True);store.execute('UPDATE cameras SET record_since=0 WHERE id=?',(cid,))
+    monkeypatch.setattr(media_time,'first_video_pts',lambda init,fragment:float(fragment))
+    def stamp(value):return datetime.fromisoformat('2026-10-24T'+value+'+01:00').timestamp()
+    def feed(worker,times):
+        (worker.folder/'init.mp4').write_bytes(b'init')
+        lines=['#EXTM3U']
+        for i,value in enumerate(times):
+            epoch=stamp(value);name=f'seg_{i:09d}.m4s'
+            (worker.folder/name).write_bytes(str(epoch).encode())
+            lines += ['#EXT-X-PROGRAM-DATE-TIME:'+datetime.fromtimestamp(epoch,timezone.utc).isoformat(),'#EXTINF:4,',name]
+        (worker.folder/'index.m3u8').write_text('\n'.join(lines)+'\n')
+        (worker.folder/'timing.json').write_text(json.dumps({'source':'camera-rtcp','pts_to_utc':0}))
+        worker.ingest()
+    from datetime import timezone
+    first=Worker(store,store.camera(cid));feed(first,['19:59:56','20:00:00','20:19:56'])
+    resumed=Worker(store,store.camera(cid));feed(resumed,['20:30:00','20:30:04','20:59:56','21:00:00'])
+    rows=store.rows('SELECT * FROM segments ORDER BY start')
+    paths={r['relative_path'] for r in rows}
+    assert len(rows)==7 and len(paths)==4
+    assert rows[0]['relative_path']!=rows[1]['relative_path']
+    assert rows[1]['relative_path']==rows[2]['relative_path']
+    assert rows[2]['relative_path']!=rows[3]['relative_path']
+    assert rows[3]['relative_path']==rows[4]['relative_path']==rows[5]['relative_path']
+    assert rows[5]['relative_path']!=rows[6]['relative_path']
+    for row in rows:
+        payload=str(row['start']).encode()
+        assert store.fragment_bytes(row)==payload
+        assert client.get(f'/api/fragments/{row["id"]}.m4s').content==payload
+        assert client.get(f'/api/download/{row["id"]}').content==b'init'+payload
+    timeline=client.get('/api/timeline',params={'camera':cid,'start':stamp('20:19:56'),'end':stamp('21:00:04'),'bucket':3600}).json()
+    assert timeline['ranges'][0]==[stamp('20:19:56'),stamp('20:20:00')]
+    assert timeline['ranges'][1][0]==stamp('20:30:00')
+    path=store.archive_path(rows[3]);length=path.stat().st_size
+    with path.open('ab') as handle:handle.write(b'uncommitted crash tail')
+    store.reconcile();assert path.stat().st_size==length
+    # Whole-file retention deletes every index row belonging to that hour.
+    first_size=store.archive_path(rows[0]).stat().st_size
+    second_size=store.archive_path(rows[1]).stat().st_size
+    used=store.storage()['used_bytes']
+    assert used==sum((store.recordings_root/p).stat().st_size for p in paths)
+    store.set('quota_gb',(used-first_size-second_size+1)/1e9);store.set('reserve_gb',0)
+    store.prune()
+    remaining=store.rows('SELECT * FROM segments')
+    assert {r['id'] for r in remaining}=={r['id'] for r in rows[3:]}
+    assert list((store.camera_folder(cid)/'Saves').glob('*.mp4'))
+
+
+def test_supervisor_keeps_retrying_then_resumes_without_record_helper(tmp_path,monkeypatch):
+    import core
+    store=Store(tmp_path/'data')
+    store.execute("INSERT INTO cameras(id,name,host,port,username,password,path) VALUES('cam','Camera','test',554,'u','p','/test')")
+    store.record('cam',True);store.set_mode('storage')
+    clock=[1000];attempts=[]
+    class Process:
+        def __init__(self,alive):self.alive=alive
+        def poll(self):return None if self.alive else 1
+    class FakeWorker:
+        def __init__(self,store,camera):
+            self.camera=camera;self.mode=store.get('mode');self.folder=store.root/'live'/'cam'/str(len(attempts))
+            self.probe=None;self.process=Process(len(attempts)>=2);self.started=clock[0];self.last_segment=0
+        def start(self):attempts.append(self)
+        def poll_probe(self):pass
+        def ingest(self):
+            if self.process.alive:self.last_segment=clock[0]
+        def stop(self):pass
+    monkeypatch.setattr(core,'Worker',FakeWorker)
+    monkeypatch.setattr(core.time,'time',lambda:clock[0])
+    engine=Engine(store)
+    class Event:
+        ticks=0
+        def is_set(self):return self.ticks>=6
+        def wait(self,seconds):self.ticks+=1;clock[0]+=11
+    engine.stop_event=Event();engine.run()
+    assert len(attempts)==3 and attempts[-1].process.alive
+    assert attempts[-1].last_segment>0 and store.camera('cam')['record_enabled']
+    assert len({w.folder for w in attempts})==3
+    store.db.close()

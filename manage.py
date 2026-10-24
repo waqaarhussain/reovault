@@ -47,6 +47,8 @@ def setup():
         except ValueError:
             print('Enter a number from 1 to 1000000.')
     store.set('quota_gb',quota)
+    choice=input('Mode: 1 storage only, 2 live only, 3 both [3]: ').strip() or '3'
+    store.set_mode({'1':'storage','2':'live','3':'both'}.get(choice,'both'))
     store.db.close()
     print('Dashboard configured. Add camera connections in the dashboard after installation.\n')
 
@@ -85,6 +87,7 @@ def select_camera(cameras,name=None):
 def record_command(args):
     if args==['status']:
         data=api('status')
+        print('Mode: '+data.get('mode','both')+(' (archiving paused)' if data.get('mode')=='live' else ''))
         for c in data['cameras']:
             timing=data['statuses'].get(c['id'],{}).get('timing_source','waiting-camera-rtcp')
             print(f"{c['name']}: {'ON' if c['record_enabled'] else 'OFF'}; time source: {timing}")
@@ -96,6 +99,26 @@ def record_command(args):
     result=api(action,camera_id=camera['id'])
     print(f"{camera['name']}: recording {'ON' if action=='start' else 'OFF'}")
     if action=='start':print('Only this camera was enabled. Newly added cameras stay OFF. Capture timestamps must verify before footage is archived.')
+
+
+def mode_command(args):
+    labels={'storage':'Storage only','live':'Live view only','both':'Storage and live view'}
+    current=api('status')['mode']
+    if args==['status']:
+        print('Current mode: '+labels[current]);return
+    value=args[0] if len(args)==1 else None
+    if value is None:
+        print('Current mode: '+labels[current])
+        for i,(key,label) in enumerate(labels.items(),1):print(f'{i}. {label} ({key})')
+        value=input('Choose mode [1/2/3]: ').strip().lower()
+        value={'1':'storage','2':'live','3':'both'}.get(value,value)
+    if value not in labels:sys.exit('Usage: reovault mode [storage|live|both|status]')
+    api('mode',mode=value)
+    print('Mode: '+labels[value])
+    print('Per-camera recording choices are preserved. New cameras stay OFF until record "Camera Name".')
+    if value=='storage':print('Live serving and compatible conversion are disabled. Only recording-enabled cameras connect.')
+    if value=='live':print('Archiving is paused for every camera. Existing footage remains available.')
+    print('Camera connections may restart briefly while the mode changes.')
 
 
 def download_command():
@@ -145,4 +168,5 @@ if __name__=='__main__':
     if args==['setup']:setup()
     elif args==['password']:reset_password()
     elif args==['download']:download_command()
+    elif args and args[0]=='mode':mode_command(args[1:])
     else:record_command(args)

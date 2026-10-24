@@ -10,7 +10,7 @@ curl -fsSL https://raw.githubusercontent.com/waqaarhussain/reovault/main/bootstr
 
 If curl is missing, install it first with `sudo apt-get update && sudo apt-get install -y curl`.
 
-The installer asks for a dashboard username/password and recording storage allowance on first installation. It detects the VPS public IP and prints `http://VPS_IP:8765`. Allow inbound TCP 8765 in the VPS/provider firewall. No domain or certificate is required. The dashboard uses HTTP as requested, so login and video traffic are not encrypted in transit. Native RTSP and the optional ONVIF HTTP connection are also unencrypted.
+The installer asks for a dashboard username/password recording storage allowance and operating mode on first installation. It detects the VPS public IP and prints `http://VPS_IP:8765`. Allow inbound TCP 8765 in the VPS/provider firewall. No domain or certificate is required. The dashboard uses HTTP as requested, so login and video traffic are not encrypted in transit. Native RTSP and the optional ONVIF HTTP connection are also unencrypted.
 
 On subsequent installs, the config, footage and per-camera recording states are preserved. For future GitHub changes, run:
 
@@ -40,7 +40,7 @@ RTSP alone does not reliably expose the device's configured display name. If ONV
 
 Port forwarding requires a reachable public home IP. DDNS cannot bypass carrier-grade NAT or an upstream router. Camera HTTPS is not needed by this version. Only enable/forward the protocols actually being used.
 
-Adding a camera starts its **live preview**, with a disposable live buffer. It does not start persistent recording, even if every other camera is recording. The dashboard cannot turn recording on; only the local `record` helper can.
+In live or both mode, adding a camera starts its **live preview**, with a disposable live buffer. In storage-only mode, a new camera stays disconnected until you enable its recording. It does not start persistent recording, even if every other camera is recording. The dashboard cannot turn recording on; only the local `record` helper can.
 
 ## Record individual cameras
 
@@ -60,6 +60,35 @@ Only the selected camera changes. Existing enabled cameras remain enabled after 
 
 `record status` shows each switch and its capture-time source. A switch can be on while the camera is offline or waiting for verified timestamps; that does not mean footage is being archived yet. The dashboard reports that state.
 
+## Choose what the VPS does
+
+Run `reovault mode` for an interactive menu, or select directly:
+
+```bash
+reovault mode storage
+reovault mode live
+reovault mode both
+reovault mode status
+```
+
+| Mode | Continuous storage | Live view | Compatible preview conversion |
+| --- | --- | --- | --- |
+| `storage` | Cameras enabled with `record` | Disabled | Disabled |
+| `live` | Paused for every camera | Enabled | Only cameras configured for it |
+| `both` | Cameras enabled with `record` | Enabled | Only cameras configured for it |
+
+Your camera recording switches are preserved when changing mode. Returning from live-only to storage/both resumes previously enabled cameras; new cameras remain off. `record` refuses to start archiving in live-only mode and tells you to change mode first. Use `record stop "Camera Name"` to clear a camera's saved choice. Mode changes may briefly restart camera connections. Previously stored footage stays available for playback/export in every mode.
+
+Storage-only still receives the original camera stream and uses a short disposable fragment buffer internally, but it does not serve live video or run the optional H.264 preview conversion. Cameras with recording off have no RTSP worker in that mode. Live-only keeps its disposable preview buffer without archiving it. Passing through original 4K video uses far less CPU than converting it; storage and network traffic still need enough capacity.
+
+## Connection outages and hourly files
+
+The supervisor keeps trying each required camera until it reconnects. Attempts have bounded connection/read timeouts, with retries after failed or stale sessions. Recording switches remain enabled throughout an outage. After the camera returns and its capture timestamps verify, recording resumes automatically without another `record` command. Retry delays and the next keyframe mean recovery is not instantaneous.
+
+Every reconnect starts a separate file. Files also split at clock-hour changes using camera capture timestamps in the configured timezone (Europe/London by default). For example, an outage from 20:20 to 20:30 produces one file covering the available footage before 20:20, another beginning after reconnection near 20:30, and a new file at the 21:00 hour boundary. A file can therefore be shorter than an hour. Keyframe/fragment alignment can put the split a few seconds after the exact hour; original encoded video is preserved with no boundary re-encoding. UTC offsets in file names distinguish repeated hours when daylight saving ends.
+
+No blank video is inserted into the gap, and missing footage is not fetched from the NVR. Timeline gaps remain visible. Any NVR footage recorded locally during an internet outage remains independent of this VPS recorder.
+
 ## Camera time, live time and export time
 
 RTSP ingestion uses PyAV with its bundled modern FFmpeg libraries. Encoded H.264/H.265 packets are remuxed without video re-encoding. AAC source audio is copied. If another source audio codec is encountered, the dashboard explicitly reports video-only capture for this version.
@@ -77,10 +106,10 @@ Physical Reolink firmware must still be tested to confirm that it supplies the e
 New continuous recording files are independently playable fragmented MP4 files, stored as:
 
 ```text
-/Reolink/Camera Name/2026-10-24_19-57-00+0100_session_seg_000000001.mp4
+/Reolink/Camera Name/2026-10-24_19-57-00+0100_hour_session_id.mp4
 ```
 
-Original fragments are small internal chunks, but dashboard playback groups them into **1 hour, 30 minutes, 15 minutes or 5 minutes** with a daily timeline, gaps and click-to-seek. Each stored file includes the initialization data required to play it independently. Video remains in its original codec and resolution.
+Original fragments are small internal chunks, but dashboard playback groups them into **1 hour, 30 minutes, 15 minutes or 5 minutes** with a daily timeline, gaps and click-to-seek. Several indexed fragments share one hourly file, which includes initialization data and can be played independently, including while it is still growing. Internal fragment indexes keep timeline playback and range exports precise without duplicating video storage. A browser segment download extracts just that indexed fragment into `Saves`. Video remains in its original codec and resolution.
 
 Manually saved clips are separate:
 
@@ -118,7 +147,7 @@ Clicking an individual segment's **Download original** link in the dashboard als
 
 ## Retention, storage and maintenance
 
-Oldest continuous footage is deleted first at the configured recording allowance or free-space reserve. `Saves` clips are **not automatically deleted** by recording rotation. They consume disk space, which the free-space reserve checks. Delete saved clips manually through SFTP when they are no longer needed.
+Oldest continuous footage is deleted first at the configured recording allowance or free-space reserve. New hourly files rotate as whole files, including all their fragment index entries; older per-fragment files remain supported. If retention removes an active file, the next fragment begins a new file. `Saves` clips are **not automatically deleted** by recording rotation. They consume disk space, which the free-space reserve checks. Delete saved clips manually through SFTP when they are no longer needed.
 
 Exports pin their input fragments while FFmpeg reads them, so retention cannot remove the inputs halfway through a job. Only one range export runs at a time. If the service restarts during an export, rerun the helper. A suddenly interrupted export may leave a hidden `.export-*` working directory in `Saves`; it contains temporary inputs, not a completed saved clip.
 

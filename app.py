@@ -139,10 +139,11 @@ def status(request: Request):
     cameras = []
     for c in STORE.cameras():
         c.pop('password')
-        c.update(statuses.get(c['id'], {'online': False, 'state': 'disabled' if not c['enabled'] else 'connecting',
+        c['record_active']=bool(c['record_enabled'] and STORE.get('mode')!='live' and c['enabled'])
+        c.update(statuses.get(c['id'], {'online': False, 'state': 'disabled' if not c['enabled'] else ('standby' if STORE.get('mode')=='storage' and not c['record_enabled'] else 'connecting'),
                                        'live_url': None, 'compatible_url': None, 'session': None}))
         cameras.append(c)
-    return {'cameras': cameras, 'recording':any(c['record_enabled'] for c in cameras), 'timezone':STORE.get('timezone'), 'storage': STORE.storage(),
+    return {'cameras': cameras, 'mode':STORE.get('mode'),'recording':any(c['record_active'] for c in cameras), 'timezone':STORE.get('timezone'), 'storage': STORE.storage(),
             'engine_warning': ENGINE.error, 'csrf': csrf(request.cookies.get('reovault_session', '')),
             'username': SETTINGS.get('username', 'admin'), 'server_time': time.time()}
 
@@ -267,7 +268,11 @@ async def control(request: Request):
         raise HTTPException(403)
     body = await small_json(request)
     action=body.get('action');cid=str(body.get('camera_id',''))
-    if action in ('start','stop'):
+    if action=='mode':
+        try:STORE.set_mode(body.get('mode'))
+        except ValueError as e:raise HTTPException(400,str(e))
+    elif action in ('start','stop'):
+        if action=='start' and STORE.get('mode')=='live':raise HTTPException(400,'Live-only mode pauses recording. Run reovault mode and choose storage or both first.')
         try:STORE.record(cid,action=='start')
         except ValueError as e:raise HTTPException(400,str(e))
     elif action=='export':
@@ -279,7 +284,7 @@ async def control(request: Request):
         return dict(job)
     elif action not in ('status','list'):raise HTTPException(400)
     cameras=[{k:c[k] for k in ('id','name','device_name','record_enabled','onvif_port','clock_offset')} for c in STORE.cameras(bool(body.get('include_deleted')))]
-    return {'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses()}
+    return {'mode':STORE.get('mode'),'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses()}
 
 
 def safe_path(base, relative):
@@ -293,6 +298,7 @@ def safe_path(base, relative):
 
 @app.get('/media/{kind}/{relative:path}')
 def media(kind: str, relative: str):
+    if kind=='live' and STORE.get('mode')=='storage':raise HTTPException(403,'Live view is disabled in storage-only mode.')
     if kind not in ('live', 'archive'):
         raise HTTPException(404)
     path = safe_path(STORE.root / kind, relative)
@@ -356,11 +362,16 @@ def fragment(sid:int):
     rows=STORE.rows('SELECT * FROM segments WHERE id=?',(sid,))
     if not rows:raise HTTPException(404)
     row=rows[0]
-    try:handle=STORE.archive_path(row).open('rb');handle.seek(row['init_size'])
+    try:handle=STORE.archive_path(row).open('rb');handle.seek(row.get('byte_offset') or row['init_size'])
     except OSError:raise HTTPException(404)
     def stream():
         try:
-            while block:=handle.read(1024*1024):yield block
+            remaining=row.get('payload_size') or max(0,os.fstat(handle.fileno()).st_size-row['init_size'])
+            while remaining:
+                block=handle.read(min(1024*1024,remaining))
+                if not block:break
+                remaining-=len(block)
+                yield block
         finally:handle.close()
     return StreamingResponse(stream(),media_type='video/mp4')
 
@@ -379,9 +390,7 @@ def download(sid:int):
             if not output.exists():
                 if shutil.disk_usage(saves).free<row['size']+STORE.get('reserve_gb')*1e9:raise HTTPException(507,'Not enough free space to save this clip.')
                 temp=output.with_suffix('.tmp')
-                with temp.open('wb') as handle:
-                    if not row['init_size']:handle.write(STORE.initialization(row))
-                    with STORE.archive_path(row).open('rb') as source:shutil.copyfileobj(source,handle)
+                STORE.standalone(row,temp)
                 temp.replace(output)
         except OSError:raise HTTPException(404,'The recording expired or could not be saved.')
     return FileResponse(output,media_type='video/mp4',filename=output.name)

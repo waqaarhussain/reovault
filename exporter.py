@@ -49,13 +49,7 @@ class Exports:
                     raise ValueError('Not enough free space to save this clip while keeping the disk reserve.')
                 for i,row in enumerate(rows):
                     target=staging/f'{i:08d}.mp4';source=self.store.archive_path(row)
-                    if row.get('init_size'):
-                        try:os.link(source,target)
-                        except OSError:shutil.copyfile(source,target)
-                    else:
-                        with target.open('wb') as handle:
-                            handle.write(self.store.initialization(row))
-                            with source.open('rb') as fragment:shutil.copyfileobj(fragment,handle)
+                    self.store.standalone(row,target)
             lines=['ffconcat version 1.0'];signature=None
             for i,row in enumerate(rows):
                 filename=f'{i:08d}.mp4'

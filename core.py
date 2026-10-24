@@ -61,7 +61,7 @@ class Store:
                 'folder':'TEXT','onvif_port':'INTEGER NOT NULL DEFAULT 0','device_name':'TEXT','clock_offset':'REAL'}.items():
             if name not in columns:self.db.execute(f'ALTER TABLE cameras ADD COLUMN {name} {definition}')
         columns={r[1] for r in self.db.execute('PRAGMA table_info(segments)')}
-        for name,definition in {'relative_path':'TEXT','init_size':'INTEGER NOT NULL DEFAULT 0','timing_source':"TEXT NOT NULL DEFAULT 'legacy-server'"}.items():
+        for name,definition in {'relative_path':'TEXT','init_size':'INTEGER NOT NULL DEFAULT 0','timing_source':"TEXT NOT NULL DEFAULT 'legacy-server'",'byte_offset':'INTEGER NOT NULL DEFAULT 0','payload_size':'INTEGER NOT NULL DEFAULT 0'}.items():
             if name not in columns:self.db.execute(f'ALTER TABLE segments ADD COLUMN {name} {definition}')
         self.db.commit()
         self.setting_default('recording',False)
@@ -69,6 +69,7 @@ class Store:
         self.setting_default('quota_gb',100)
         self.setting_default('reserve_gb',2)
         self.setting_default('timezone','Europe/London')
+        self.setting_default('mode','both')
         self.setting_default('recordings_root',os.environ.get('REOVAULT_RECORDINGS',str(self.root/'Reolink')))
         self.recordings_root=Path(os.environ.get('REOVAULT_RECORDINGS',self.get('recordings_root')))
         self.recordings_root.mkdir(parents=True,exist_ok=True)
@@ -112,6 +113,21 @@ class Store:
             self.camera_folder(camera_id)
             self.execute('UPDATE cameras SET record_enabled=?,record_since=? WHERE id=?',(int(enabled),since,camera_id))
 
+    def set_mode(self, mode):
+        if mode not in ('storage','live','both'):raise ValueError('Choose storage, live or both.')
+        self.set('mode',mode)
+
+    def fragment_bytes(self,row):
+        with self.archive_path(row).open('rb') as handle:
+            handle.seek(row.get('byte_offset') or row['init_size'])
+            return handle.read(row['payload_size']) if row.get('payload_size') else handle.read()
+
+    def standalone(self,row,target):
+        # A bounded fragment copy also pins inputs against whole-hour retention.
+        with Path(target).open('wb') as handle:
+            handle.write(self.initialization(row))
+            handle.write(self.fragment_bytes(row))
+
     def camera_folder(self,camera_id):
         with self.lock:
             camera=self.camera(camera_id)
@@ -141,7 +157,7 @@ class Store:
         total = self.rows('SELECT COALESCE(SUM(size),0) AS n FROM segments')[0]['n']
         # Include init segments, which are required to decode each archive session.
         total += sum(p.stat().st_size for p in (self.root / 'archive').glob('*/*/init.mp4') if p.exists())
-        disk = shutil.disk_usage(self.root)
+        disk = shutil.disk_usage(self.recordings_root)
         return {'used_bytes': total, 'quota_bytes': self.get('quota_gb') * 10**9,
                 'disk_free_bytes': disk.free, 'reserve_bytes': self.get('reserve_gb') * 10**9, 'recordings_root':str(self.recordings_root),
                 'saved_bytes':sum(p.stat().st_size for p in self.recordings_root.glob('*/Saves/*.mp4') if p.exists())}
@@ -161,8 +177,14 @@ class Store:
             path = self.archive_path(row)
             size = path.stat().st_size if path.exists() and path.stat().st_nlink==1 else 0
             path.unlink(missing_ok=True)
-            self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
-            used -= row['size']
+            if row.get('payload_size'):
+                # Rotate entire hourly files, never punch holes in an active MP4.
+                removed=self.rows('SELECT COALESCE(SUM(size),0) AS n FROM segments WHERE relative_path=?',(row['relative_path'],))[0]['n']
+                self.execute('DELETE FROM segments WHERE relative_path=?',(row['relative_path'],))
+            else:
+                removed=row['size']
+                self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
+            used -= removed
             free += size
             if not self.rows('SELECT id FROM segments WHERE camera_id=? AND session=? LIMIT 1',
                              (row['camera_id'], row['session'])):
@@ -184,7 +206,13 @@ class Store:
         for row in self.rows('SELECT * FROM segments'):
             if not self.archive_path(row).exists():
                 self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
+        # Ignore uncommitted append tails after a crash; keep every indexed fragment.
+        for item in self.rows('SELECT relative_path,MAX(byte_offset+payload_size) AS end FROM segments WHERE payload_size>0 GROUP BY relative_path'):
+            path=self.recordings_root/item['relative_path']
+            if path.exists():
+                with path.open('r+b') as handle:handle.truncate(item['end'])
         for p in self.recordings_root.glob('*/*.mp4'):
+            if '_hour_' in p.name and p not in known:p.unlink(missing_ok=True)
             if re.fullmatch(r'\d{4}-\d{2}-\d{2}_.+_seg_\d+\.mp4',p.name) and p not in known:
                 p.unlink(missing_ok=True)
         for p in (self.root / 'archive').glob('*/*/*'):
@@ -260,6 +288,9 @@ class Worker:
         self.timing_source = "waiting-camera-rtcp"
         self.latest_capture = None
         self.audio_warning = None
+        self.mode = store.get('mode')
+        self.archive_key = None
+        self.archive_output = None
 
     def start(self):
         # Probe closes before streaming starts; do not consume a second permanent camera slot.
@@ -330,32 +361,46 @@ class Worker:
             path=self.folder/name
             if name in self.seen:continue
             camera=self.store.camera(self.camera['id'])
-            if not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
+            if self.mode=='live' or not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
+                self.archive_key=None
                 self.seen.add(name);continue
             if self.timing_source!='camera-rtcp':
                 self.warning='Waiting for camera RTCP capture timestamps. Live view works; recording waits for verified camera time.'
                 continue
             day=datetime.fromtimestamp(start,ZoneInfo(self.store.get('timezone')))
-            target=self.store.camera_folder(camera['id'])
-            target.mkdir(parents=True,exist_ok=True)
-            filename=day.strftime('%Y-%m-%d_%H-%M-%S%z')+'_'+self.session+'_'+name.replace('.m4s','.mp4')
-            output=target/filename;temp=output.with_suffix('.tmp')
-            try:
-                with temp.open('wb') as handle:
-                    handle.write(init)
-                    with path.open('rb') as fragment:shutil.copyfileobj(fragment,handle)
-                temp.replace(output)
-            except FileNotFoundError:
-                temp.unlink(missing_ok=True);self.warning='A live segment expired before archiving.';continue
-            relative=output.relative_to(self.store.recordings_root).as_posix()
-            self.store.execute('INSERT OR IGNORE INTO segments(camera_id,session,name,start,duration,size,relative_path,init_size,timing_source) VALUES(?,?,?,?,?,?,?,?,?)',
-                (camera['id'],self.session,name,start,duration,output.stat().st_size,relative,len(init),'camera-rtcp'))
+            key=day.strftime('%Y-%m-%d_%H%z')
+            # One file per clock hour and connection session. Re-enabling also opens a new file.
+            with self.store.lock:
+                if self.archive_key!=key or not self.archive_output or not self.archive_output.exists():
+                    target=self.store.camera_folder(camera['id'])
+                    filename=day.strftime('%Y-%m-%d_%H-%M-%S%z')+'_hour_'+self.session+'_'+uuid.uuid4().hex[:6]+'.mp4'
+                    self.archive_output=target/filename
+                    self.archive_key=key
+                output=self.archive_output
+                if self.store.rows('SELECT id FROM segments WHERE camera_id=? AND session=? AND name=?',(camera['id'],self.session,name)):
+                    self.seen.add(name);continue
+                previous_size=output.stat().st_size if output.exists() else 0
+                try:
+                    fragment=path.read_bytes()
+                    with output.open('ab') as handle:
+                        if handle.tell()==0:handle.write(init)
+                        offset=handle.tell()
+                        handle.write(fragment)
+                        handle.flush();os.fsync(handle.fileno())
+                    relative=output.relative_to(self.store.recordings_root).as_posix()
+                    self.store.execute('INSERT OR IGNORE INTO segments(camera_id,session,name,start,duration,size,relative_path,init_size,timing_source,byte_offset,payload_size) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                        (camera['id'],self.session,name,start,duration,len(fragment)+(len(init) if offset==len(init) else 0),relative,len(init),'camera-rtcp',offset,len(fragment)))
+                except Exception:
+                    # Roll back partial appends if disk writes or the index commit fail.
+                    if output.exists():
+                        with output.open('r+b') as handle:handle.truncate(previous_size)
+                    raise
             self.seen.add(name)
             self.warning=None
         entries=calibrated
         # Keep memory bounded during long-running camera sessions.
         self.seen.intersection_update({e[0] for e in entries})
-        if self.camera['compatible'] and entries and self.transcoder is None:
+        if self.mode!='storage' and self.camera['compatible'] and entries and self.transcoder is None:
             target = self.folder / 'compatible'
             target.mkdir(exist_ok=True)
             self.transcoder = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
@@ -410,8 +455,8 @@ class Worker:
         online = self.process is not None and self.process.poll() is None and time.time() - self.last_segment < 35
         relative = self.folder.relative_to(self.store.root / 'live').as_posix()
         return {'online': online, 'state': 'online' if online else ('connecting' if time.time()-self.started<35 else 'reconnecting'),
-                'live_url': '/media/live/' + relative + '/index.m3u8' if original.exists() else None,
-                'compatible_url': '/media/live/' + relative + '/compatible/index.m3u8' if compatible.exists() else None,
+                'live_url': '/media/live/' + relative + '/index.m3u8' if original.exists() and self.mode!='storage' else None,
+                'compatible_url': '/media/live/' + relative + '/compatible/index.m3u8' if compatible.exists() and self.mode!='storage' else None,
                 'warning': self.warning, 'session': self.session, 'codec': self.codec, 'resolution': self.resolution, 'timing_source':self.timing_source, 'latest_capture':self.latest_capture, 'audio_warning':self.audio_warning}
 
 
@@ -446,11 +491,12 @@ class Engine:
                 if time.time()-last_prune > 5:
                     self.store.prune()
                     last_prune = time.time()
-                cameras = {c['id']: c for c in self.store.cameras() if c['enabled']}
+                mode=self.store.get('mode')
+                cameras = self.desired_cameras()
                 with self.lock:
                     for cid in list(self.workers):
                         worker = self.workers[cid]
-                        if cid not in cameras or any(worker.camera.get(k)!=cameras[cid].get(k) for k in ('host','port','username','password','path','compatible','enabled')):
+                        if worker.mode!=mode or cid not in cameras or any(worker.camera.get(k)!=cameras[cid].get(k) for k in ('host','port','username','password','path','compatible','enabled')):
                             worker.stop()
                             del self.workers[cid]
                     for cid, camera in cameras.items():
@@ -483,6 +529,10 @@ class Engine:
             for worker in self.workers.values():
                 worker.stop()
             self.workers.clear()
+
+    def desired_cameras(self):
+        storage_only=self.store.get('mode')=='storage'
+        return {c['id']:c for c in self.store.cameras() if c['enabled'] and (not storage_only or c['record_enabled'])}
 
     def statuses(self):
         with self.lock:
