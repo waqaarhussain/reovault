@@ -128,10 +128,16 @@ def diagnose_command():
     print('Engine diagnostic: '+json.dumps(data.get('engine_diagnostic')))
     for c in data['cameras']:
         status=data['statuses'].get(c['id'],{})
-        print(c['name']+': '+json.dumps({k:status.get(k) for k in ('state','codec','resolution','timing_source','warning')}))
+        print(c['name']+': '+json.dumps({k:status.get(k) for k in ('state','session','codec','resolution','timing_source','warning')}))
+        timings=sorted((DATA/'live'/c['id']).glob('*/timing.json'),key=lambda p:p.stat().st_mtime,reverse=True)
+        if timings:
+            try:print('Latest source timing: '+timings[0].read_text())
+            except OSError:pass
         failures=sorted((DATA/'live'/c['id']).glob('*/failure.json'),key=lambda p:p.stat().st_mtime,reverse=True)
         if failures:
-            try:print('Latest capture failure: '+failures[0].read_text())
+            try:
+                print('Latest capture failure age (seconds): '+str(round(time.time()-failures[0].stat().st_mtime,1)))
+                print('Latest capture failure: '+failures[0].read_text())
             except OSError:pass
     import subprocess
     result=subprocess.run([sys.executable,'-c','import av; print("PyAV:",av.__version__)'],capture_output=True,text=True)

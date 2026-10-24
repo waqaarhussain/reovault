@@ -101,3 +101,45 @@ def test_download_helper_guides_camera_date_and_time(monkeypatch,capsys):
     export=next(value for action,value in calls if action=='export')
     assert export['camera_id']=='a' and export['end']-export['start']==13*60
     assert '/Reolink/Driveway/Saves/clip.mp4' in capsys.readouterr().out
+
+
+
+def test_mux_failure_is_classified_without_retaining_ffmpeg_log_urls():
+    import av
+    from capture import mux_packet,CaptureFailure
+    original=av.logging.get_level();av.logging.set_level(av.logging.ERROR)
+    class InvalidOutput:
+        def mux(self,packet):
+            av.logging.log(av.logging.ERROR,'mp4','Application provided invalid, non monotonically increasing dts to muxer; rtsp://admin:private@example.invalid')
+            raise ValueError('rtsp://admin:private@example.invalid')
+    try:
+        with pytest.raises(CaptureFailure) as failure:
+            mux_packet(InvalidOutput(),object(),{'stage':'mux','stream_type':'audio','dts':5,'previous_dts':10})
+        detail=failure.value.detail
+        assert detail['mux_reason']=='non-monotonic-timestamps' and detail['stream_type']=='audio'
+        assert 'private' not in json.dumps(detail) and 'example.invalid' not in json.dumps(detail)
+    finally:av.logging.set_level(original)
+
+
+def test_real_aac_timestamp_regression_produces_specific_mux_diagnostic(tmp_path):
+    import av
+    import subprocess
+    from capture import mux_packet,CaptureFailure
+    source=tmp_path/'audio.m4a'
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','sine=sample_rate=48000','-t','1','-c:a','aac',str(source)],check=True,timeout=15)
+    original=av.logging.get_level();av.logging.set_level(av.logging.ERROR)
+    try:
+        with av.open(str(source)) as incoming:
+            output=av.open(str(tmp_path/'out.mp4'),'w')
+            stream=output.add_stream_from_template(incoming.streams.audio[0])
+            try:
+                with pytest.raises(CaptureFailure) as failure:
+                    for i,packet in enumerate(incoming.demux(incoming.streams.audio[0])):
+                        if packet.dts is None:continue
+                        if i==15:packet.dts=-2048;packet.pts=-2048
+                        packet.stream=stream
+                        mux_packet(output,packet,{'stage':'mux','stream_type':'audio'})
+                assert failure.value.detail['type']=='ArgumentError'
+                assert failure.value.detail['mux_reason']=='non-monotonic-timestamps'
+            finally:output.close()
+    finally:av.logging.set_level(original)
