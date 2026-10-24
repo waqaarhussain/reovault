@@ -32,7 +32,7 @@ class Realtime:
                 source=(native_preview_camera(camera) if camera['compatible'] else None) or camera
                 name='camera_'+camera['id']
                 # Opus conversion is audio-only and starts on demand. Video is passed through.
-                streams[name]=[rtsp_url(source),'ffmpeg:'+name+'#audio=opus']
+                streams[name]=[rtsp_url(source),'ffmpeg:'+name+'#audio=opus#raw=-ar:a 48000 -ac:a 2']
             public=os.environ.get('REOVAULT_WEBRTC_IP') or self.store.get('webrtc_public_ip')
             config={'api':{'listen':'127.0.0.1:'+str(self.api_port)},
                 'rtsp':{'listen':'127.0.0.1:'+str(self.rtsp_port)},
@@ -73,6 +73,30 @@ class Realtime:
         if len(result)>65536:raise ValueError('Unexpected WebRTC response.')
         self.error=None
         return result.decode()
+
+    def diagnostics(self):
+        result=self.status();result['streams']={}
+        if not result['available']:return result
+        try:
+            with urllib.request.urlopen(self.base+'/api/streams',timeout=2) as response:
+                data=json.loads(response.read(1048576))
+            # Never return raw gateway objects: URLs, SDP and commands contain credentials.
+            for camera in self.store.cameras():
+                stream=data.get('camera_'+camera['id'],{})
+                summary={}
+                for side,tracks in (('producers','receivers'),('consumers','senders')):
+                    summary[side]=[]
+                    for peer in stream.get(side,[]) or []:
+                        codecs=[]
+                        for track in peer.get(tracks,[]) or []:
+                            codec=track.get('codec',{})
+                            name=codec.get('codec_name') or codec.get('name')
+                            if name in ('H264','H265','HEVC','AAC','OPUS','PCMA','PCMU','h264','hevc','aac','opus'):
+                                codecs.append({'codec':name,**{k:track[k] for k in ('bytes','packets') if isinstance(track.get(k),(int,float))}})
+                        summary[side].append({'tracks':codecs,**{k:peer[k] for k in ('recv','send') if isinstance(peer.get(k),(int,float))}})
+                result['streams'][camera['id']]=summary
+        except (OSError,ValueError,TypeError,AttributeError):result['diagnostic_unavailable']=True
+        return result
 
     def status(self):
         with self.lock:return {'available':self.ready and self.process is not None and self.process.poll() is None,'generation':self.generation,'port':self.media_port,'error':self.error,'installed':self.binary.is_file(),'exit_code':self.process.poll() if self.process is not None else None}

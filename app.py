@@ -211,7 +211,9 @@ async def add_camera(request:Request):
     c=clean_camera(await small_json(request))
     device=None
     if c['onvif_port']:
-        try:device=await run_in_threadpool(discover,c);c['name']=device['name']
+        try:
+            device=await run_in_threadpool(discover,c)
+            if c['name']=='Camera awaiting device name':c['name']=device['name']
         except Exception:raise HTTPException(400,'Cannot read the camera name. Check its ONVIF port, or enter a manual name and leave ONVIF blank.')
     STORE.execute('INSERT INTO cameras(id,name,host,port,username,password,path,enabled,compatible,onvif_port) VALUES(?,?,?,?,?,?,?,?,?,?)',tuple(c.values()))
     if device:STORE.execute('UPDATE cameras SET device_name=?,clock_offset=? WHERE id=?',(device['name'],device['clock_offset'],c['id']))
@@ -226,7 +228,8 @@ async def edit_camera(cid: str, request: Request):
     c = clean_camera(await small_json(request), old)
     if c['onvif_port']:
         try:
-            device=await run_in_threadpool(discover,c);c['name']=device['name']
+            device=await run_in_threadpool(discover,c)
+            if c['name']=='Camera awaiting device name':c['name']=device['name']
             STORE.execute('UPDATE cameras SET device_name=?,clock_offset=? WHERE id=?',(device['name'],device['clock_offset'],cid))
         except Exception:raise HTTPException(400,'Cannot read the camera name. Check its ONVIF port, or leave it blank to use a manual name.')
     if not c['onvif_port']:STORE.execute('UPDATE cameras SET device_name=NULL,clock_offset=NULL WHERE id=?',(cid,))
@@ -269,7 +272,7 @@ async def control(request: Request):
         raise HTTPException(403)
     body = await small_json(request)
     action=body.get('action');cid=str(body.get('camera_id',''))
-    if action=='rtc-status':return ENGINE.realtime.status()
+    if action=='rtc-status':return ENGINE.realtime.diagnostics()
     if action=='mode':
         try:STORE.set_mode(body.get('mode'))
         except ValueError as e:raise HTTPException(400,str(e))

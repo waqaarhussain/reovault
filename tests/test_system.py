@@ -246,6 +246,19 @@ def test_device_names_and_local_helper_do_not_enable_future_cameras(app_module,c
     helper.close()
 
 
+def test_manual_camera_name_survives_onvif_refresh(app_module,client,monkeypatch):
+    monkeypatch.setattr(app_module,'discover',lambda c:{'name':'IPC-BO','clock_offset':0.1})
+    body={'name':'Front Left','host':'home.eero.online','port':2004,'onvif_port':2005,'username':'admin','password':'test','path':'/Preview_01_main'}
+    result=client.post('/api/cameras',json=body)
+    assert result.status_code==200
+    cid=result.json()['id']
+    assert app_module.STORE.camera(cid)['name']=='Front Left'
+    assert client.put('/api/cameras/'+cid,json={**body,'name':'Driveway'}).status_code==200
+    camera=app_module.STORE.camera(cid)
+    assert camera['name']=='Driveway' and camera['device_name']=='IPC-BO'
+    assert camera['record_enabled']==0
+
+
 def test_mode_controls_preserve_camera_choices_and_block_live(app_module,client):
     cid=add_camera(client);store=app_module.STORE
     helper=TestClient(app_module.app,client=('127.0.0.1',12345))
