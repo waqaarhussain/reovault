@@ -284,7 +284,7 @@ async def control(request: Request):
         return dict(job)
     elif action not in ('status','list'):raise HTTPException(400)
     cameras=[{k:c[k] for k in ('id','name','device_name','record_enabled','onvif_port','clock_offset')} for c in STORE.cameras(bool(body.get('include_deleted')))]
-    return {'mode':STORE.get('mode'),'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses()}
+    return {'mode':STORE.get('mode'),'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses(),'engine_diagnostic':ENGINE.diagnostic,'engine_warning':ENGINE.error}
 
 
 def safe_path(base, relative):

@@ -121,6 +121,23 @@ def mode_command(args):
     print('Camera connections may restart briefly while the mode changes.')
 
 
+def diagnose_command():
+    data=api('status')
+    print('Mode: '+data.get('mode','both'))
+    print('Engine warning: '+str(data.get('engine_warning') or 'none'))
+    print('Engine diagnostic: '+json.dumps(data.get('engine_diagnostic')))
+    for c in data['cameras']:
+        status=data['statuses'].get(c['id'],{})
+        print(c['name']+': '+json.dumps({k:status.get(k) for k in ('state','codec','resolution','timing_source','warning')}))
+        failures=sorted((DATA/'live'/c['id']).glob('*/failure.json'),key=lambda p:p.stat().st_mtime,reverse=True)
+        if failures:
+            try:print('Latest capture failure: '+failures[0].read_text())
+            except OSError:pass
+    import subprocess
+    result=subprocess.run([sys.executable,'-c','import av; print("PyAV:",av.__version__)'],capture_output=True,text=True)
+    print(result.stdout.strip() if result.returncode==0 else 'PyAV import failed; dependency or shared-library issue.')
+
+
 def download_command():
     from clip_input import date_input,range_input,interval
     data=api('list',include_deleted=True);camera=select_camera(data['cameras'])
@@ -168,5 +185,6 @@ if __name__=='__main__':
     if args==['setup']:setup()
     elif args==['password']:reset_password()
     elif args==['download']:download_command()
+    elif args==['diagnose']:diagnose_command()
     elif args and args[0]=='mode':mode_command(args[1:])
     else:record_command(args)

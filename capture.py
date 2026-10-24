@@ -8,8 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-import av
-from core import atomic_json
+from core import atomic_json, safe_error
 
 
 def packet_clock(packet):
@@ -23,6 +22,7 @@ def packet_clock(packet):
 
 
 def capture(url,folder,stop=None):
+    import av
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     av.logging.set_level(av.logging.PANIC)
     options={'rtsp_transport':'tcp','timeout':'15000000'} if url.startswith('rtsp:') else {}
@@ -64,10 +64,14 @@ def capture(url,folder,stop=None):
 
 if __name__=='__main__':
     signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))
+    info=None
     try:
         info=json.load(sys.stdin)
         capture(info['url'],info['folder'])
     except SystemExit:raise
-    except Exception:
-        # A generic nonzero exit lets the supervisor retry without leaking camera credentials.
+    except Exception as error:
+        # Persist structural diagnostics, never raw third-party messages containing input URLs.
+        if info:
+            try:atomic_json(Path(info['folder'])/'failure.json',safe_error(error))
+            except Exception:pass
         sys.exit(1)

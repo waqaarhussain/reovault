@@ -161,11 +161,12 @@ case "${1:-status}" in
   logs) journalctl -u reovault -n 80 --no-pager ;;
   update) exec bash /opt/reovault/current/update-live.sh ;;
   version) cat /opt/reovault/current/REVISION ;;
+  diagnose) exec /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py diagnose ;;
   mode) shift; exec /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py mode "$@" ;;
   password) /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py password
             chown root:reovault /etc/reovault/config.json
             systemctl restart reovault ;;
-  *) echo 'Usage: reovault [status|restart|logs|password|update|version|mode]' >&2; exit 1 ;;
+  *) echo 'Usage: reovault [status|restart|logs|password|update|version|mode|diagnose]' >&2; exit 1 ;;
 esac
 WRAPPER
 chmod 0755 /usr/local/bin/record /usr/local/bin/download /usr/local/bin/reovault

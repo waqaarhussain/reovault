@@ -1,6 +1,8 @@
 """ReoVault recording engine. All timestamps in the index are UTC epoch seconds."""
 import hashlib
 import json
+import logging
+import traceback
 import os
 import re
 import sys
@@ -15,6 +17,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
+
+
+def safe_error(error):
+    """Structural diagnostics only: no exception messages, source text, URLs or locals."""
+    frames=[Path(f.filename).name+':'+str(f.lineno)+':'+f.name for f in traceback.extract_tb(error.__traceback__)]
+    result={'type':type(error).__name__,'frames':frames[-8:]}
+    number=getattr(error,'errno',None)
+    if isinstance(number,int):result['errno']=number
+    return result
 
 
 def atomic_json(path, value):
@@ -258,7 +269,10 @@ def playlist_entries(path):
     entries, start, duration = [], None, None
     for line in path.read_text().splitlines():
         if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
-            start = datetime.fromisoformat(line.split(':', 1)[1].replace('Z', '+00:00')).timestamp()
+            # FFmpeg emits +0000; Python 3.10 requires +00:00 here.
+            stamp=line.split(':',1)[1].replace('Z','+00:00')
+            stamp=re.sub(r'([+-]\d{2})(\d{2})$',r'\1:\2',stamp)
+            start = datetime.fromisoformat(stamp).timestamp()
         elif line.startswith('#EXTINF:'):
             duration = float(line.split(':', 1)[1].split(',')[0])
         elif line and not line.startswith('#') and start is not None and duration is not None:
@@ -468,6 +482,7 @@ class Engine:
         self.stop_event = threading.Event()
         self.thread = None
         self.error = None
+        self.diagnostic = None
 
     def start(self):
         self.store.reconcile()
@@ -521,9 +536,12 @@ class Engine:
                         if folder.is_dir() and folder not in active and time.time()-folder.stat().st_mtime>120:
                             shutil.rmtree(folder, ignore_errors=True)
                 self.error = None
-            except Exception:
-                # Never return raw third-party exception text or input URLs to the web UI.
-                self.error = 'Recording engine needs attention. Check disk space, camera connection and configured ports.'
+            except Exception as error:
+                detail=safe_error(error)
+                if detail!=self.diagnostic:
+                    logging.getLogger('reovault').error('Engine failure: %s',json.dumps(detail))
+                self.diagnostic=detail
+                self.error = 'Recording engine needs attention. Run reovault diagnose for the error location.'
             self.stop_event.wait(1)
         with self.lock:
             for worker in self.workers.values():

@@ -175,3 +175,7 @@ python3 -m venv .test-venv
 The suite covers per-camera recording isolation, new-camera defaults, one-time migration, date/time formats, DST ambiguity, packet clock references, actual H.264/H.265 fragments and exports, original-codec playback, `Saves` preservation, timelines, authentication and deployment rollback. Local RTSP and browser tests use synthetic footage. Physical cameras, forwarding and sustained 4K operation still need testing on your network.
 
 hls.js is bundled under its license in `static/vendor/hls.LICENSE.txt`. PyAV is installed from its published Python wheel. No camera credentials or footage are committed to GitHub.
+
+## Camera connection diagnostics
+
+Run `reovault diagnose` if a camera connects during codec discovery but remains reconnecting. It reports operating mode, engine error type/location, camera stream status, the latest capture failure and whether PyAV imports. Structural diagnostics omit raw third-party exception messages, URLs, credentials, source text and local variable contents. Share this helper output rather than a credential-bearing RTSP URL.

@@ -344,3 +344,30 @@ def test_supervisor_keeps_retrying_then_resumes_without_record_helper(tmp_path,m
     assert attempts[-1].last_segment>0 and store.camera('cam')['record_enabled']
     assert len({w.folder for w in attempts})==3
     store.db.close()
+
+
+@pytest.mark.parametrize('offset',['+0000','+0100','-0430','+00:00','Z'])
+def test_ffmpeg_playlist_timezone_with_python310_parser(tmp_path,monkeypatch,offset):
+    import core
+    import re
+    from datetime import datetime
+    class Python310Datetime(datetime):
+        @classmethod
+        def fromisoformat(cls,value):
+            if re.search(r'[+-]\d{4}$',value):raise ValueError('Python 3.10 rejects compact timezone offsets')
+            return super().fromisoformat(value)
+    monkeypatch.setattr(core,'datetime',Python310Datetime)
+    path=tmp_path/'index.m3u8'
+    path.write_text('#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2026-10-24T20:00:00.123'+offset+'\n#EXTINF:4,\nseg_000.m4s\n')
+    result=core.playlist_entries(path)
+    assert result==[('seg_000.m4s',datetime.strptime('2026-10-24T20:00:00.123'+offset,'%Y-%m-%dT%H:%M:%S.%f%z').timestamp(),4)]
+
+
+def test_error_diagnostics_never_include_url_password_or_exception_message():
+    import core
+    secret='rtsp://admin:very-private-password@example.invalid/camera'
+    try:raise ValueError(secret)
+    except ValueError as error:detail=core.safe_error(error)
+    value=json.dumps(detail)
+    assert detail['type']=='ValueError' and detail['frames']
+    assert 'very-private-password' not in value and 'example.invalid' not in value and 'rtsp://' not in value
