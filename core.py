@@ -321,7 +321,8 @@ class Worker:
         # Probe closes before streaming starts; do not consume a second permanent camera slot.
         self.probe = subprocess.Popen(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
             *rtsp_timeout('ffprobe', 10000000), '-select_streams', 'v:0', '-show_entries',
-            'stream=codec_name,width,height', '-of', 'json', rtsp_url(self.camera)],
+            'stream=codec_name,width,height', '-of', 'json',
+            *(['-analyzeduration','1000000','-probesize','32768'] if self.preview_only else []),rtsp_url(self.camera)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.started = time.time()
 

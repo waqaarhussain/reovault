@@ -28,13 +28,15 @@ class Realtime:
         with self.lock:
             if mode=='storage' or not cameras or not self.binary.is_file():
                 self.stop();self.error=None;return
-            streams={}
+            streams={};preload={}
             for camera in cameras.values():
                 source=(native_preview_camera(camera) if camera['compatible'] else None) or camera
                 name='camera_'+camera['id']
                 # A separate local source avoids converter recursion and shares one camera connection.
                 source_name=name+'_source'
                 streams[source_name]=[rtsp_url(source)]
+                # Keep only the native low-resolution input warm. Opus remains viewer-demanded.
+                if camera['compatible'] and native_preview_camera(camera):preload[source_name]='video&audio'
                 local='rtsp://127.0.0.1:'+str(self.rtsp_port)+'/'+source_name
                 # go2rtc's ffmpeg: module rejects FFmpeg <5 (Ubuntu 22.04 ships 4.x).
                 # exec: uses an explicit command compatible with both 4.x and newer.
@@ -49,6 +51,7 @@ class Realtime:
                 'rtsp':{'listen':'127.0.0.1:'+str(self.rtsp_port)},
                 'webrtc':{'listen':':'+str(self.media_port),'candidates':[str(public)+':'+str(self.media_port)] if public else ['stun:'+str(self.media_port)]},
                 'log':{'level':'error'},'streams':streams}
+            if preload:config['preload']=preload
             if public:config['webrtc']['ice_servers']=[]
             signature=json.dumps(config,sort_keys=True)
             if self.signature==signature and self.process is not None and self.process.poll() is None:
