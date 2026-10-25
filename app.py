@@ -411,6 +411,38 @@ def fragment(sid:int):
     return StreamingResponse(stream(),media_type='video/mp4')
 
 
+def browser_export_job(job):
+    result={key:job.get(key) for key in ('id','status','error','warning')}
+    if job['status']=='complete':
+        result['url']='/api/exports/'+job['id']+'/file'
+        result['filename']=Path(job['path']).name
+    return result
+
+
+@app.post('/api/exports')
+async def create_browser_export(request:Request):
+    body=await small_json(request)
+    try:job=EXPORTS.start(str(body['camera_id']),float(body['start']),float(body['end']),available_only=True)
+    except (KeyError,TypeError,ValueError) as error:raise HTTPException(400,str(error))
+    return browser_export_job(job)
+
+
+@app.get('/api/exports/{job_id}')
+def browser_export_status(job_id:str):
+    job=EXPORTS.jobs.get(job_id)
+    if not job:raise HTTPException(404,'Export status was lost after a server restart. Download the block again.')
+    return browser_export_job(job)
+
+
+@app.get('/api/exports/{job_id}/file')
+def browser_export_file(job_id:str):
+    job=EXPORTS.jobs.get(job_id)
+    if not job or job['status']!='complete':raise HTTPException(404,'The exported clip is not available.')
+    path=Path(job['path'])
+    if not path.is_file():raise HTTPException(404,'The saved clip has been removed.')
+    return FileResponse(path,media_type='video/mp4',filename=path.name)
+
+
 @app.get('/api/download/{sid}')
 def download(sid:int):
     import shutil

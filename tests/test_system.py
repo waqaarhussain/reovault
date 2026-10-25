@@ -429,3 +429,59 @@ def test_optional_onvif_clock_never_requests_device_name(monkeypatch):
     monkeypatch.setattr(device,'soap',unavailable)
     assert device.discover({'onvif_port':2005})['clock_offset'] is None
     assert calls==['GetSystemDateAndTime']
+
+
+def test_browser_downloads_selected_five_minute_original(app_module,client,tmp_path):
+    import hashlib
+    from exporter import Exports
+    store=app_module.STORE;store.set('reserve_gb',0)
+    cid=add_camera(client);worker=Worker(store,store.camera(cid))
+    source=tmp_path/'five-minutes.mp4'
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=size=320x180:rate=2',
+        '-t','300','-c:v','libx265','-preset','ultrafast','-x265-params',
+        'pools=1:frame-threads=1:keyint=8:min-keyint=8:bframes=0','-threads','2',str(source)],
+        check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=60)
+    options=hls_output(worker.folder,codec='hevc');options[options.index('-hls_list_size')+1]='0'
+    options[options.index('-hls_flags')+1]='temp_file+program_date_time+independent_segments'
+    subprocess.run(['ffmpeg','-v','error','-i',str(source),*options],check=True,timeout=30)
+    entries=playlist_entries(worker.folder/'index.m3u8');assert len(entries)==75
+    from media_time import first_video_pts
+    start=1792884000
+    pts=first_video_pts((worker.folder/'init.mp4').read_bytes(),(worker.folder/entries[0][0]).read_bytes())
+    (worker.folder/'timing.json').write_text(json.dumps({'source':'camera-rtcp','pts_to_utc':start-pts,'updated':time.time()}))
+    store.record(cid,True);store.execute('UPDATE cameras SET record_since=0 WHERE id=?',(cid,));worker.ingest()
+    rows=store.rows('SELECT * FROM segments WHERE camera_id=? ORDER BY start',(cid,));assert len(rows)==75
+    archive=store.archive_path(rows[0]);before=hashlib.sha256(archive.read_bytes()).hexdigest()
+    app_module.EXPORTS=Exports(store)
+    outsider=TestClient(app_module.app)
+    assert outsider.post('/api/exports',json={}).status_code==401
+    assert outsider.get('/api/exports/missing/file').status_code==401
+    outsider.close()
+    assert client.post('/api/exports',json={'camera_id':cid,'start':start,'end':start+300},headers={'X-CSRF-Token':'bad'}).status_code==403
+    assert client.post('/api/exports',json={'camera_id':cid,'start':'nan','end':start+300}).status_code==400
+    assert client.get('/api/exports/missing').status_code==404
+
+    def download_block():
+        response=client.post('/api/exports',json={'camera_id':cid,'start':start,'end':start+300})
+        assert response.status_code==200,response.text
+        job=response.json();deadline=time.monotonic()+90
+        assert 'path' not in job
+        while job['status'] not in ('complete','failed') and time.monotonic()<deadline:
+            time.sleep(.05);job=client.get('/api/exports/'+job['id']).json()
+        assert job['status']=='complete',job
+        response=client.get(job['url']);assert response.status_code==200
+        assert response.headers['content-disposition'].startswith('attachment;')
+        target=tmp_path/(job['id']+'.mp4');target.write_bytes(response.content)
+        probe=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration:stream=codec_name,width,height','-of','json',str(target)]))
+        assert probe['streams'][0]['codec_name']=='hevc' and probe['streams'][0]['width']==320
+        assert hashlib.sha256(archive.read_bytes()).hexdigest()==before
+        return job,float(probe['format']['duration'])
+
+    job,length=download_block();assert 299<=length<=301,length
+    assert 'omitted' not in job['warning']
+    # Missing footage must not turn a block download into an error or fabricate frames.
+    store.execute('DELETE FROM segments WHERE id=?',(rows[30]['id'],))
+    with pytest.raises(ValueError,match='gap'):
+        app_module.EXPORTS.export(store.camera(cid),start,start+300,{'id':'strict-gap'})
+    job,length=download_block();assert 295<=length<=297,length
+    assert 'Unrecorded portions' in job['warning']

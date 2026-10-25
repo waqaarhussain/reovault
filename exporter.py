@@ -1,5 +1,6 @@
 """Original-codec time-range exports, pinned against retention while FFmpeg reads them."""
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -15,8 +16,8 @@ class Exports:
     def __init__(self,store):
         self.store=store;self.jobs={};self.lock=threading.Lock()
 
-    def start(self,camera_id,start,end):
-        if not end>start or end-start>86400:raise ValueError('Choose a time range of up to 24 hours.')
+    def start(self,camera_id,start,end,available_only=False):
+        if not all(map(math.isfinite,(start,end))) or not end>start or end-start>86400:raise ValueError('Choose a time range of up to 24 hours.')
         camera=self.store.camera(camera_id)
         if not camera:raise ValueError('Camera not found')
         if not self.lock.acquire(blocking=False):raise ValueError('An export is already running. Wait for it to finish.')
@@ -24,7 +25,9 @@ class Exports:
         job={'id':job_id,'status':'preparing','error':None,'path':None,'warning':None}
         self.jobs[job_id]=job
         def run():
-            try:self.export(camera,start,end,job)
+            try:
+                if available_only:self.export(camera,start,end,job,available_only=True)
+                else:self.export(camera,start,end,job)
             except Exception as error:
                 job['status']='failed'
                 job['error']=str(error) if isinstance(error,ValueError) else 'Export failed. Check available disk space and that the footage still exists.'
@@ -32,7 +35,7 @@ class Exports:
         threading.Thread(target=run,daemon=True).start()
         return dict(job)
 
-    def export(self,camera,start,end,job):
+    def export(self,camera,start,end,job,available_only=False):
         saves=self.store.camera_folder(camera['id'])/'Saves';saves.mkdir(exist_ok=True)
         staging=saves/('.export-'+job['id']);staging.mkdir()
         try:
@@ -41,9 +44,9 @@ class Exports:
                 if not rows:raise ValueError('No recording exists for that time range.')
                 coverage=start
                 for row in rows:
-                    if row['start']>coverage+.3:raise ValueError('The requested interval contains a recording gap. Select a continuous range shown on the timeline.')
+                    if not available_only and row['start']>coverage+.3:raise ValueError('The requested interval contains a recording gap. Select a continuous range shown on the timeline.')
                     coverage=max(coverage,row['start']+row['duration'])
-                if coverage<end-.3:raise ValueError('The end of that interval has not been recorded yet or has expired.')
+                if not available_only and coverage<end-.3:raise ValueError('The end of that interval has not been recorded yet or has expired.')
                 disk=shutil.disk_usage(saves)
                 if disk.free<sum(r['size'] for r in rows)+self.store.get('reserve_gb')*1e9:
                     raise ValueError('Not enough free space to save this clip while keeping the disk reserve.')
@@ -51,6 +54,10 @@ class Exports:
                     target=staging/f'{i:08d}.mp4';source=self.store.archive_path(row)
                     self.store.standalone(row,target)
             lines=['ffconcat version 1.0'];signature=None
+            recorded_seconds=0;covered=start
+            for row in rows:
+                left=max(start,row['start'],covered);right=min(end,row['start']+row['duration'])
+                recorded_seconds+=max(0,right-left);covered=max(covered,right)
             for i,row in enumerate(rows):
                 filename=f'{i:08d}.mp4'
                 probe=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','format=start_time:stream=codec_type,codec_name,width,height,time_base','-of','json',str(staging/filename)],stderr=subprocess.DEVNULL,timeout=20))
@@ -72,8 +79,9 @@ class Exports:
             if result.returncode or not temporary.exists() or temporary.stat().st_size==0:raise ValueError('FFmpeg could not join that range without re-encoding. Try a smaller interval.')
             temporary.replace(output)
             job['warning']='Original-quality cuts follow camera keyframes; the edge may extend slightly outside your requested times.'
+            if available_only and recorded_seconds<end-start-.3:job['warning']+=' Unrecorded portions of the selected block are omitted.'
             metadata={'camera':camera['name'],'requested_start':a.isoformat(),'requested_end':b.isoformat(),
-                'timezone':str(zone),'source_timing':sorted({r['timing_source'] for r in rows}),'video_reencoded':False,'boundary_note':job['warning']}
+                'timezone':str(zone),'source_timing':sorted({r['timing_source'] for r in rows}),'video_reencoded':False,'recorded_seconds':recorded_seconds,'boundary_note':job['warning']}
             output.with_suffix('.json').write_text(json.dumps(metadata,indent=2))
             job.update(status='complete',path=str(output),camera=camera['name'],start=start,end=end)
         finally:shutil.rmtree(staging,ignore_errors=True)
