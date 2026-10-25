@@ -30,7 +30,14 @@ def test_real_4k_hevc_preview_preserves_archive_and_camera_clock(tmp_path):
     worker.ingest();rows=store.rows('SELECT * FROM segments ORDER BY start')
     assert len(rows)==2
     archive=store.archive_path(rows[0]);before=hashlib.sha256(archive.read_bytes()).hexdigest()
-    previews=PlaybackPreviews(store);paths=[previews.fragment(row) for row in rows]
+    previews=PlaybackPreviews(store)
+    profile=previews.profile(rows[0]);assert profile['codec']=='hevc' and profile['width']==3840 and profile['height']==2160
+    assert profile['codecs'].startswith('hvc1.1.')
+    assert previews.diagnostics()['conversions']==0,'Inspecting source metadata must not convert footage'
+    paths=[previews.fragment(row) for row in rows]
+    metrics=previews.diagnostics();assert metrics['conversions']==2
+    assert metrics['last_completed']['speed']>0 and metrics['last_completed']['footage_seconds']>0
+    assert 'path' not in json.dumps(metrics) and 'password' not in json.dumps(metrics)
     timestamps=[]
     for path,row in zip(paths,rows):
         details=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','stream=codec_name,width,height,start_time','-of','json',str(path)]))

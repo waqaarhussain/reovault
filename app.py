@@ -147,7 +147,7 @@ def status(request: Request):
                                        'live_url': None, 'compatible_url': None, 'session': None}))
         cameras.append(c)
     return {'cameras': cameras, 'mode':STORE.get('mode'),'recording':any(c['record_active'] for c in cameras), 'timezone':STORE.get('timezone'), 'storage': STORE.storage(),
-            'engine_warning': ENGINE.error, 'realtime':ENGINE.realtime.status(), 'csrf': csrf(request.cookies.get('reovault_session', '')),
+            'engine_warning': ENGINE.error, 'playback_preview':PREVIEWS.diagnostics(), 'realtime':ENGINE.realtime.status(), 'csrf': csrf(request.cookies.get('reovault_session', '')),
             'username': SETTINGS.get('username', 'admin'), 'server_time': time.time()}
 
 
@@ -276,7 +276,7 @@ async def control(request: Request):
         return dict(job)
     elif action not in ('status','list'):raise HTTPException(400)
     cameras=[{k:c[k] for k in ('id','name','device_name','record_enabled','onvif_port','clock_offset')} for c in STORE.cameras(bool(body.get('include_deleted')))]
-    return {'mode':STORE.get('mode'),'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses(),'engine_diagnostic':ENGINE.diagnostic,'engine_warning':ENGINE.error}
+    return {'mode':STORE.get('mode'),'cameras':cameras,'storage':STORE.storage(),'timezone':STORE.get('timezone'),'statuses':ENGINE.statuses(),'engine_diagnostic':ENGINE.diagnostic,'engine_warning':ENGINE.error,'playback_preview':PREVIEWS.diagnostics()}
 
 
 def safe_path(base, relative):
@@ -371,7 +371,9 @@ def playback(cid: str, start: float, end: float, compatible: bool = False):
         lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", (f"/api/playback-preview/{row['id']}.ts" if compatible else f"/api/fragments/{row['id']}.m4s")]
         previous, previous_end = session, row['start']+row['duration']
     lines.append('#EXT-X-ENDLIST')
-    return PlainTextResponse('\n'.join(lines)+'\n', media_type='application/vnd.apple.mpegurl')
+    profile=PREVIEWS.profile(rows[0]) if not compatible else {'codec':'h264'}
+    headers={'X-Reovault-'+key.title():str(value) for key,value in profile.items()}
+    return PlainTextResponse('\n'.join(lines)+'\n', media_type='application/vnd.apple.mpegurl',headers=headers)
 
 
 @app.get('/api/playback-preview/{sid}.ts')

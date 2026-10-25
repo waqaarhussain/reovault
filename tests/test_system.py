@@ -453,6 +453,10 @@ def test_browser_downloads_selected_five_minute_original(app_module,client,tmp_p
     rows=store.rows('SELECT * FROM segments WHERE camera_id=? ORDER BY start',(cid,));assert len(rows)==75
     archive=store.archive_path(rows[0]);before=hashlib.sha256(archive.read_bytes()).hexdigest()
     app_module.EXPORTS=Exports(store)
+    original=client.get('/api/playback/'+cid+'.m3u8',params={'start':start,'end':start+300})
+    assert original.headers['x-reovault-codec']=='hevc' and original.headers['x-reovault-width']=='320'
+    assert original.headers['x-reovault-codecs'].startswith('hvc1.')
+    assert app_module.PREVIEWS.diagnostics()['conversions']==0
     outsider=TestClient(app_module.app)
     assert outsider.post('/api/exports',json={}).status_code==401
     assert outsider.get('/api/exports/missing/file').status_code==401

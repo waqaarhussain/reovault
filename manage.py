@@ -124,6 +124,7 @@ def diagnose_command():
     data=api('status')
     print('Mode: '+data.get('mode','both'))
     print('WebRTC: '+json.dumps(api('rtc-status')))
+    print('Playback preview: '+json.dumps(data.get('playback_preview')))
     print('Engine warning: '+str(data.get('engine_warning') or 'none'))
     print('Engine diagnostic: '+json.dumps(data.get('engine_diagnostic')))
     for c in data['cameras']:
