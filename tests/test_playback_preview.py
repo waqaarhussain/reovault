@@ -42,6 +42,10 @@ def test_real_4k_hevc_preview_preserves_archive_and_camera_clock(tmp_path):
     assert abs(timestamps[1]-timestamps[0]-(rows[1]['start']-rows[0]['start']))<.05
     assert hashlib.sha256(archive.read_bytes()).hexdigest()==before
     cached=paths[0].read_bytes();assert previews.fragment(rows[0]).read_bytes()==cached
+    # Already prepared playback must not block behind another viewer's conversion.
+    previews.lock.acquire()
+    try:assert previews.fragment(rows[0]).read_bytes()==cached
+    finally:previews.lock.release()
     assert not list(previews.root.glob('*.mp4')) and not list(previews.root.glob('*.tmp'))
     original=tmp_path/'original.mp4';store.standalone(rows[0],original)
     details=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_entries','stream=codec_name,width,height','-of','json',str(original)]))

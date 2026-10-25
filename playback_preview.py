@@ -31,6 +31,10 @@ class PlaybackPreviews:
         identity=json.dumps({k:row.get(k) for k in ('camera_id','session','name','start','duration','relative_path','byte_offset','payload_size')},sort_keys=True)
         key=str(row['id'])+'_'+hashlib.sha256(identity.encode()).hexdigest()[:20]
         output=self.root/(key+'.ts')
+        # A cached viewer must not queue behind someone else's new 4K conversion.
+        if output.is_file():
+            try:os.utime(output,None);return output
+            except FileNotFoundError:pass
         if not self.lock.acquire(timeout=30):raise ValueError('Playback preview is busy. Try again shortly.')
         try:
             self.prune()
@@ -44,7 +48,7 @@ class PlaybackPreviews:
                 # Independent MPEG-TS fragments retain a common camera-derived clock.
                 # Reset decoded PTS, then offset to the indexed UTC time. MPEG-TS wraps
                 # at 33 bits; adjacent fragments wrap together as required by HLS.
-                command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-threads','2','-i',str(source),
+                command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-filter_threads','2','-threads','2','-i',str(source),
                     '-map','0:v:0','-map','0:a:0?','-vf',
                     "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,setpts=PTS-STARTPTS",
                     '-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-crf','25','-pix_fmt','yuv420p','-threads','2','-bf','0',
