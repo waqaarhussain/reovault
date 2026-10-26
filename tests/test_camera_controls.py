@@ -234,3 +234,55 @@ def test_native_preview_path_preserves_credentials_channel_and_main_config(tmp_p
     worker=Worker(store,camera,preview_only=True,folder=tmp_path/'data/live/a/preview')
     assert worker.preview_only and worker.folder.name=='preview'
     store.db.close()
+
+
+@pytest.mark.parametrize('confirm,stop_fails',[('FORMAT',False),('no',False),('FORMAT',True)])
+def test_format_helper_quiesces_service_clears_footage_and_preserves_config(tmp_path,monkeypatch,capsys,confirm,stop_fails):
+    import manage
+    import subprocess
+    root=tmp_path/'data';store=Store(root)
+    for cid in ('a','b','disabled','deleted'):insert(store,cid,cid)
+    store.execute("UPDATE cameras SET enabled=0 WHERE id='disabled'")
+    store.execute("UPDATE cameras SET deleted=1 WHERE id='deleted'")
+    store.set_mode('live');store.set('quota_gb',123)
+    folder=store.camera_folder('a')
+    original=folder/'2026-10-26_hour_test.mp4';original.write_bytes(b'4k')
+    preview=folder/'Browser';preview.mkdir();(preview/'hour.mp4').write_bytes(b'small')
+    saves=folder/'Saves';saves.mkdir();(saves/'clip.mp4').write_bytes(b'clip');(saves/'clip.json').write_text('{}')
+    notes=folder/'notes.txt';notes.write_text('unrelated')
+    for name in ('archive','live','playback-cache'):
+        directory=root/name;directory.mkdir(exist_ok=True);(directory/'fixture').mkdir();(directory/'fixture'/'file').write_bytes(b'old')
+    store.execute("INSERT INTO segments(camera_id,session,name,start,duration,size) VALUES('a','s','x',1,4,3)")
+    store.execute("INSERT INTO browser_segments(camera_id,session,name,start,duration,size) VALUES('a','s','x',1,4,5)")
+    credentials=store.camera('a')['password'];store.db.close()
+    config=tmp_path/'config.json';config.write_text('private-login')
+    monkeypatch.setattr(manage,'DATA',root)
+    monkeypatch.setattr('builtins.input',lambda prompt:confirm)
+    calls=[]
+    def run(args,check):
+        calls.append(args)
+        if args[1]=='stop':
+            assert original.exists() and (saves/'clip.mp4').exists()
+            if stop_fails:raise subprocess.CalledProcessError(1,args)
+        else:
+            assert not original.exists() and not preview.exists() and not saves.exists()
+    monkeypatch.setattr(subprocess,'run',run)
+    if stop_fails:
+        with pytest.raises(subprocess.CalledProcessError):manage.format_command()
+    else:manage.format_command()
+    after=Store(root)
+    if confirm!='FORMAT' or stop_fails:
+        assert original.read_bytes()==b'4k' and (saves/'clip.mp4').read_bytes()==b'clip'
+        assert after.rows('SELECT * FROM segments') and after.rows('SELECT * FROM browser_segments')
+        assert not after.camera('a')['record_enabled'] and after.get('mode')=='live'
+        assert len(calls)==(1 if stop_fails else 0)
+    else:
+        assert calls==[['systemctl','stop','reovault'],['systemctl','start','reovault']]
+        assert not after.rows('SELECT * FROM segments') and not after.rows('SELECT * FROM browser_segments')
+        assert after.camera('a')['record_enabled'] and after.camera('b')['record_enabled']
+        assert not after.camera('disabled')['record_enabled'] and not after.camera('deleted')['record_enabled']
+        assert after.camera('a')['record_since']>0 and after.get('mode')=='both'
+        for name in ('archive','live','playback-cache'):assert not list((root/name).iterdir())
+    assert after.camera('a')['password']==credentials and after.get('quota_gb')==123
+    assert config.read_text()=='private-login' and notes.read_text()=='unrelated'
+    after.db.close()

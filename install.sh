@@ -156,6 +156,12 @@ set -euo pipefail
 if [[ ${EUID} -ne 0 ]]; then exec sudo /usr/local/bin/download "$@"; fi
 exec env REOVAULT_RECORDINGS=/Reolink /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py download
 WRAPPER
+cat > /usr/local/bin/format <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${EUID} -ne 0 ]]; then exec sudo /usr/local/bin/format "$@"; fi
+exec env REOVAULT_RECORDINGS=/Reolink /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py format
+WRAPPER
 cat > /usr/local/bin/reovault <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -167,14 +173,15 @@ case "${1:-status}" in
   update) exec bash /opt/reovault/current/update-live.sh ;;
   version) cat /opt/reovault/current/REVISION ;;
   diagnose) exec /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py diagnose ;;
+  format) exec /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py format ;;
   mode) shift; exec /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py mode "$@" ;;
   password) /opt/reovault/current/venv/bin/python /opt/reovault/current/manage.py password
             chown root:reovault /etc/reovault/config.json
             systemctl restart reovault ;;
-  *) echo 'Usage: reovault [status|restart|logs|password|update|version|mode|diagnose]' >&2; exit 1 ;;
+  *) echo 'Usage: reovault [status|restart|logs|password|update|version|mode|diagnose|format]' >&2; exit 1 ;;
 esac
 WRAPPER
-chmod 0755 /usr/local/bin/record /usr/local/bin/download /usr/local/bin/reovault
+chmod 0755 /usr/local/bin/record /usr/local/bin/download /usr/local/bin/reovault /usr/local/bin/format
 existing_updater="$(command -v update-live || true)"
 if [[ -z "$existing_updater" ]] || grep -qF '# reovault-update-live' "$existing_updater" 2>/dev/null; then
   install -m 0755 "$release_dir/update-live.sh" /usr/local/bin/update-live
@@ -199,6 +206,7 @@ No firewall rules were changed automatically.
 Start one camera:  record "Camera Name"
 Stop one camera:   record stop "Camera Name"
 Export a clip:     download
+Delete footage:    format  (all recordings and saved clips, then restart recording)
 Recording status: record status
 Choose mode:      reovault mode
 Future updates:   update-live  (or reovault update)

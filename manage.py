@@ -173,6 +173,44 @@ def download_command():
     print(job['warning'])
 
 
+def format_command():
+    """Offline reset so captures, playback and exports cannot race file deletion."""
+    import subprocess
+    print('Delete ALL camera recordings, browser copies and saved clips. Camera settings and login are kept.')
+    if input('Type FORMAT to delete the footage and start recording again: ').strip()!='FORMAT':
+        print('Cancelled. No recordings were deleted.');return
+    # A failed stop must abort before opening/deleting recording data.
+    subprocess.run(['systemctl','stop','reovault'],check=True)
+    store=None
+    try:
+        store=Store(DATA)
+        def remove(path):
+            if path.is_symlink() or path.is_file():path.unlink()
+            elif path.is_dir():shutil.rmtree(path)
+        # Remove only ReoVault-managed locations, not other files on the volume.
+        root=store.recordings_root
+        for folder in root.iterdir():
+            if folder.is_symlink() or not folder.is_dir():continue
+            for path in folder.glob('*.mp4'):
+                if '_hour_' in path.name or '_seg_' in path.name:remove(path)
+            for name in ('Browser','Saves'):remove(folder/name)
+        for name in ('archive','live','playback-cache'):
+            directory=store.root/name
+            if directory.is_symlink():raise ValueError('Refusing to format a linked runtime directory: '+name)
+            if directory.exists():
+                for path in directory.iterdir():remove(path)
+        with store.lock:
+            store.execute('DELETE FROM segments')
+            store.execute('DELETE FROM browser_segments')
+            store.execute('UPDATE cameras SET record_enabled=CASE WHEN deleted=0 AND enabled=1 THEN 1 ELSE 0 END,record_since=?',(time.time(),))
+            if store.get('mode')=='live':store.set_mode('both')
+        count=len([c for c in store.cameras() if c['enabled']])
+    finally:
+        if store is not None:store.db.close()
+        subprocess.run(['systemctl','start','reovault'],check=True)
+    print(f'Format complete. Recording enabled for {count} active camera(s). Capture resumes after camera timestamps verify.')
+
+
 def reset_password():
     config = json.loads(CONFIG.read_text())
     while True:
@@ -193,6 +231,7 @@ if __name__=='__main__':
     elif args==['password']:reset_password()
     elif args==['download']:download_command()
     elif args==['diagnose']:diagnose_command()
+    elif args==['format']:format_command()
     elif args==['network']:
         import ipaddress
         value=str(ipaddress.IPv4Address(os.environ['REOVAULT_PUBLIC_IP']))

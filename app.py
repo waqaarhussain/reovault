@@ -351,12 +351,15 @@ def recordings(camera: str = '', start: float = 0, end: float = 0, cursor: int =
 
 
 @app.get('/api/playback/{cid}.m3u8')
-def playback(cid: str, start: float, end: float, compatible: bool = False):
+def playback(cid: str, start: float, end: float, compatible: bool = False, browser: bool = False):
     if end<=start or end-start>86400:
         raise HTTPException(400, 'Playback is limited to one day per playlist.')
     rows = STORE.rows('SELECT * FROM segments WHERE camera_id=? AND start+duration>? AND start<? ORDER BY start,id', (cid,start,end))
     if not rows:
         raise HTTPException(404, 'No recordings in this range.')
+    saved=STORE.browser_recordings(cid,start,end,rows) if browser else []
+    if saved:rows=saved;compatible=False
+    suffix='?browser=true' if saved else ''
     import math
     lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:'+str(math.ceil(max(r['duration'] for r in rows))),
              '#EXT-X-MEDIA-SEQUENCE:0', '#EXT-X-PLAYLIST-TYPE:VOD']
@@ -366,13 +369,14 @@ def playback(cid: str, start: float, end: float, compatible: bool = False):
         if session != previous or (previous_end is not None and row['start']-previous_end>1):
             if previous is not None:
                 lines.append('#EXT-X-DISCONTINUITY')
-            if not compatible:lines.append(f'#EXT-X-MAP:URI="/api/inits/{cid}/{session}.mp4"')
+            if not compatible:lines.append(f'#EXT-X-MAP:URI="/api/inits/{cid}/{session}.mp4{suffix}"')
         stamp = datetime.fromtimestamp(row['start'],timezone.utc).isoformat()
-        lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", (f"/api/playback-preview/{row['id']}.ts" if compatible else f"/api/fragments/{row['id']}.m4s")]
+        lines += [f'#EXT-X-PROGRAM-DATE-TIME:{stamp}', f"#EXTINF:{row['duration']:.6f},", (f"/api/playback-preview/{row['id']}.ts" if compatible else f"/api/fragments/{row['id']}.m4s{suffix}")]
         previous, previous_end = session, row['start']+row['duration']
     lines.append('#EXT-X-ENDLIST')
     profile=PREVIEWS.profile(rows[0]) if not compatible else {'codec':'h264'}
     headers={'X-Reovault-'+key.title():str(value) for key,value in profile.items()}
+    headers['X-Reovault-Source']='camera-substream' if saved else ('converted' if compatible else 'original')
     return PlainTextResponse('\n'.join(lines)+'\n', media_type='application/vnd.apple.mpegurl',headers=headers)
 
 
@@ -386,8 +390,9 @@ def playback_preview(sid:int):
 
 
 @app.get('/api/inits/{cid}/{session}.mp4')
-def initialization(cid:str,session:str):
-    rows=STORE.rows('SELECT * FROM segments WHERE camera_id=? AND session=? ORDER BY start LIMIT 1',(cid,session))
+def initialization(cid:str,session:str,browser:bool=False):
+    table='browser_segments' if browser else 'segments'
+    rows=STORE.rows(f'SELECT * FROM {table} WHERE camera_id=? AND session=? ORDER BY start LIMIT 1',(cid,session))
     if not rows:raise HTTPException(404)
     try:data=STORE.initialization(rows[0])
     except OSError:raise HTTPException(404)
@@ -395,8 +400,9 @@ def initialization(cid:str,session:str):
 
 
 @app.get('/api/fragments/{sid}.m4s')
-def fragment(sid:int):
-    rows=STORE.rows('SELECT * FROM segments WHERE id=?',(sid,))
+def fragment(sid:int,browser:bool=False):
+    table='browser_segments' if browser else 'segments'
+    rows=STORE.rows(f'SELECT * FROM {table} WHERE id=?',(sid,))
     if not rows:raise HTTPException(404)
     row=rows[0]
     try:handle=STORE.archive_path(row).open('rb');handle.seek(row.get('byte_offset') or row['init_size'])

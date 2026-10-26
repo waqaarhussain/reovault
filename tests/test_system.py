@@ -175,7 +175,7 @@ def test_real_ffmpeg_recording_pause_download_and_decode(tmp_path,codec):
     worker.ingest()
     rows=store.rows('SELECT * FROM segments ORDER BY start')
     assert len(rows)==3
-    # A preview may share camera credentials/id, but must never archive its lower-resolution stream.
+    # A preview may share camera credentials/id, but must never enter the original index.
     preview=Worker(store,{**camera,'compatible':0},preview_only=True,folder=worker.folder/'preview'/'test')
     for item in worker.folder.iterdir():
         if item.is_file():shutil.copyfile(item,preview.folder/item.name)
@@ -489,3 +489,94 @@ def test_browser_downloads_selected_five_minute_original(app_module,client,tmp_p
         app_module.EXPORTS.export(store.camera(cid),start,start+300,{'id':'strict-gap'})
     job,length=download_block();assert 295<=length<=297,length
     assert 'Unrecorded portions' in job['warning']
+
+
+def test_saved_substream_playback_copies_packets_and_keeps_original_downloads(app_module,client,tmp_path,monkeypatch):
+    import hashlib
+    import av
+    from media_time import first_video_pts
+    store=app_module.STORE;cid=add_camera(client)
+    # Fixture workers never open a real network connection.
+    store.execute("UPDATE cameras SET path='/fixture',record_enabled=1,record_since=0 WHERE id=?",(cid,))
+    workers=[];start=1793008800.0
+    for small,width,height in ((False,1280,720),(True,896,512)):
+        worker=Worker(store,store.camera(cid),preview_only=small);worker.codec='h264'
+        subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i',f'testsrc2=size={width}x{height}:rate=8',
+            '-f','lavfi','-i','sine=frequency=500:sample_rate=16000','-t','12',
+            '-c:v','libx264','-preset','ultrafast','-g','32','-threads','2','-c:a','aac',
+            *['-f','hls','-hls_time','4','-hls_list_size','0','-hls_flags','program_date_time','-hls_segment_type','fmp4',
+              '-hls_segment_filename',str(worker.folder/'seg_%09d.m4s'),str(worker.folder/'raw.m3u8')]],check=True,timeout=30)
+        entries=playlist_entries(worker.folder/'raw.m3u8')
+        pts=first_video_pts((worker.folder/'init.mp4').read_bytes(),(worker.folder/entries[0][0]).read_bytes())
+        (worker.folder/'timing.json').write_text(json.dumps({'source':'camera-rtcp','pts_to_utc':start-pts}))
+        worker.ingest();worker.ingest();workers.append(worker)
+    originals=store.rows('SELECT * FROM segments ORDER BY start')
+    saved=store.rows('SELECT * FROM browser_segments ORDER BY start')
+    assert len(originals)==len(saved)==3
+    assert all('/Browser/' in row['relative_path'] for row in saved)
+    assert len({row['relative_path'] for row in saved})==1
+    before={row['relative_path']:hashlib.sha256(store.archive_path(row).read_bytes()).hexdigest() for row in originals}
+    # A direct browser request may not invoke FFmpeg conversion at all.
+    def no_conversion(*args):raise AssertionError('Saved preview must bypass conversion')
+    monkeypatch.setattr(app_module.PREVIEWS,'fragment',no_conversion)
+    for compatible in (False,True):
+        response=client.get(f'/api/playback/{cid}.m3u8',params={'start':start,'end':start+12,'browser':True,'compatible':compatible})
+        assert response.status_code==200
+        assert response.headers['X-Reovault-Source']=='camera-substream'
+        assert response.headers['X-Reovault-Width']=='896' and response.headers['X-Reovault-Height']=='512'
+        assert '/api/playback-preview/' not in response.text and '?browser=true' in response.text
+        assert response.text.count('#EXT-X-MAP:')==1
+        lines=response.text.splitlines()
+        init_url=next(line.split('"')[1] for line in lines if line.startswith('#EXT-X-MAP:'))
+        init=client.get(init_url).content
+        for row,url in zip(saved,[line for line in lines if line and not line.startswith('#')]):
+            data=client.get(url).content
+            assert data==store.fragment_bytes(row)==(workers[1].folder/row['name']).read_bytes()
+            standalone=tmp_path/'saved-browser.mp4';standalone.write_bytes(init+data)
+            with av.open(str(standalone)) as source:
+                assert source.streams.video[0].codec_context.width==896
+                assert source.streams.audio[0].codec_context.name=='aac'
+                assert sum(1 for _ in source.decode(video=0))>0
+    assert app_module.PREVIEWS.diagnostics()['conversions']==0
+    original_manifest=client.get(f'/api/playback/{cid}.m3u8',params={'start':start,'end':start+12})
+    assert original_manifest.headers['X-Reovault-Source']=='original'
+    assert original_manifest.headers['X-Reovault-Width']=='1280'
+    assert '?browser=true' not in original_manifest.text
+    # Colliding numeric row IDs never substitute preview bytes for original downloads.
+    for row in originals:
+        assert client.get('/api/download/'+str(row['id'])).content==store.initialization(row)+store.fragment_bytes(row)
+        assert hashlib.sha256(store.archive_path(row).read_bytes()).hexdigest()==before[row['relative_path']]
+    assert store.storage()['used_bytes']==sum(store.archive_path(row).stat().st_size for row in (originals[0],saved[0]))
+    assert client.get('/api/recordings',params={'camera':cid,'start':start,'end':start+12}).json()['segments'][0]['relative_path']==originals[0]['relative_path']
+    # Missing interior coverage falls back for the whole selection, preserving its time range.
+    store.execute('DELETE FROM browser_segments WHERE id=?',(saved[1]['id'],))
+    fallback=client.get(f'/api/playback/{cid}.m3u8',params={'start':start,'end':start+12,'browser':True,'compatible':True})
+    assert fallback.headers['X-Reovault-Source']=='converted' and '/api/playback-preview/' in fallback.text
+    store.db.close()
+    # An existing index can be reopened/migrated without losing either archive.
+    store=Store(app_module.STORE.root);app_module.STORE=store
+    preview_path=store.archive_path(saved[0]);committed=max(row['byte_offset']+row['payload_size'] for row in (saved[0],saved[2]))
+    with preview_path.open('ab') as handle:handle.write(b'crash tail')
+    orphan=preview_path.parent/'old_hour_orphan.mp4';orphan.write_bytes(b'orphan')
+    store.reconcile();assert preview_path.stat().st_size==committed and not orphan.exists()
+    saves=store.camera_folder(cid)/'Saves';saves.mkdir(exist_ok=True);protected=saves/'keep.mp4';protected.write_bytes(b'keep')
+    store.set('quota_gb',0);store.set('reserve_gb',0);store.prune()
+    assert not store.rows('SELECT * FROM segments') and not store.rows('SELECT * FROM browser_segments')
+    assert not preview_path.exists() and protected.read_bytes()==b'keep'
+
+
+def test_substream_recording_runs_without_live_view_and_stops_with_recording(tmp_path,monkeypatch):
+    store=Store(tmp_path/'data')
+    store.execute("INSERT INTO cameras(id,name,host,port,username,password,path,compatible) VALUES('c','Front','home',554,'u','p','/Preview_01_main',0)")
+    store.record('c',True);store.set_mode('storage')
+    starts=[]
+    monkeypatch.setattr(Worker,'start',lambda self:starts.append(self.camera['path']))
+    worker=Worker(store,store.camera('c'));worker.realtime_ready=True
+    assert worker.sync_native_preview() and starts==['/Preview_01_sub']
+    child=worker.preview_worker
+    assert child.mode=='storage' and child.preview_only
+    # Final capture harvest must never respawn another substream.
+    child.ingest_final();assert starts==['/Preview_01_sub']
+    store.record('c',False)
+    assert not worker.sync_native_preview() and worker.preview_worker is None
+    store.db.close()

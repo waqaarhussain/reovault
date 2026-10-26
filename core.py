@@ -74,6 +74,11 @@ class Store:
         columns={r[1] for r in self.db.execute('PRAGMA table_info(segments)')}
         for name,definition in {'relative_path':'TEXT','init_size':'INTEGER NOT NULL DEFAULT 0','timing_source':"TEXT NOT NULL DEFAULT 'legacy-server'",'byte_offset':'INTEGER NOT NULL DEFAULT 0','payload_size':'INTEGER NOT NULL DEFAULT 0'}.items():
             if name not in columns:self.db.execute(f'ALTER TABLE segments ADD COLUMN {name} {definition}')
+        # Independent index: low-resolution footage can never enter original downloads.
+        schema=self.db.execute("SELECT sql FROM sqlite_master WHERE name='segments'").fetchone()[0]
+        self.db.execute(schema.replace('CREATE TABLE segments','CREATE TABLE IF NOT EXISTS browser_segments',1))
+        self.db.execute('CREATE INDEX IF NOT EXISTS browser_camera_time ON browser_segments(camera_id,start)')
+        self.db.execute('CREATE INDEX IF NOT EXISTS browser_segment_time ON browser_segments(start)')
         self.db.commit()
         self.setting_default('recording',False)
         self.setting_default('record_since',0)
@@ -165,8 +170,26 @@ class Store:
             with path.open('rb') as handle:return handle.read(row['init_size'])
         return (path.parent/'init.mp4').read_bytes()
 
+    def browser_recordings(self,camera_id,start,end,originals):
+        """Use the copy only when it covers the original footage requested by the viewer."""
+        rows=self.rows('SELECT * FROM browser_segments WHERE camera_id=? AND start+duration>? AND start<? ORDER BY start,id',(camera_id,start,end))
+        existing={path for path in {self.archive_path(row) for row in rows} if path.is_file()}
+        rows=[row for row in rows if self.archive_path(row) in existing]
+        if not rows:return []
+        coverage=[]
+        for row in rows:
+            a,b=row['start'],row['start']+row['duration']
+            if coverage and a<=coverage[-1][1]+.25:coverage[-1][1]=max(coverage[-1][1],b)
+            else:coverage.append([a,b])
+        index=0
+        for original in originals:
+            a,b=max(start,original['start']),min(end,original['start']+original['duration'])
+            while index<len(coverage) and coverage[index][1]<a-.25:index+=1
+            if index==len(coverage) or coverage[index][0]>a+.25 or coverage[index][1]<b-.25:return []
+        return rows
+
     def storage(self):
-        total = self.rows('SELECT COALESCE(SUM(size),0) AS n FROM segments')[0]['n']
+        total = sum(self.rows(f'SELECT COALESCE(SUM(size),0) AS n FROM {table}')[0]['n'] for table in ('segments','browser_segments'))
         # Include init segments, which are required to decode each archive session.
         total += sum(p.stat().st_size for p in (self.root / 'archive').glob('*/*/init.mp4') if p.exists())
         disk = shutil.disk_usage(self.recordings_root)
@@ -182,23 +205,24 @@ class Store:
         info = self.storage()
         used, free = info['used_bytes'], info['disk_free_bytes']
         while used > info['quota_bytes'] or free < info['reserve_bytes']:
-            oldest = self.rows('SELECT * FROM segments ORDER BY start,id LIMIT 1')
+            oldest = self.rows("SELECT *, 'segments' AS source_table FROM segments UNION ALL SELECT *, 'browser_segments' AS source_table FROM browser_segments ORDER BY start,id LIMIT 1")
             if not oldest:
                 break
             row = oldest[0]
+            table=row['source_table']
             path = self.archive_path(row)
             size = path.stat().st_size if path.exists() and path.stat().st_nlink==1 else 0
             path.unlink(missing_ok=True)
             if row.get('payload_size'):
                 # Rotate entire hourly files, never punch holes in an active MP4.
-                removed=self.rows('SELECT COALESCE(SUM(size),0) AS n FROM segments WHERE relative_path=?',(row['relative_path'],))[0]['n']
-                self.execute('DELETE FROM segments WHERE relative_path=?',(row['relative_path'],))
+                removed=self.rows(f'SELECT COALESCE(SUM(size),0) AS n FROM {table} WHERE relative_path=?',(row['relative_path'],))[0]['n']
+                self.execute(f'DELETE FROM {table} WHERE relative_path=?',(row['relative_path'],))
             else:
                 removed=row['size']
-                self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
+                self.execute(f'DELETE FROM {table} WHERE id=?', (row['id'],))
             used -= removed
             free += size
-            if not self.rows('SELECT id FROM segments WHERE camera_id=? AND session=? LIMIT 1',
+            if not self.rows(f'SELECT id FROM {table} WHERE camera_id=? AND session=? LIMIT 1',
                              (row['camera_id'], row['session'])):
                 init = path.parent / 'init.mp4' if not row.get('relative_path') else path.parent / '.no-init-file'
                 if init.exists():
@@ -214,16 +238,19 @@ class Store:
 
     def reconcile(self):
         """Recover cleanly from a power cut between atomic file copy and index commit."""
-        known = {self.archive_path(r) for r in self.rows('SELECT * FROM segments')}
-        for row in self.rows('SELECT * FROM segments'):
-            if not self.archive_path(row).exists():
-                self.execute('DELETE FROM segments WHERE id=?', (row['id'],))
-        # Ignore uncommitted append tails after a crash; keep every indexed fragment.
-        for item in self.rows('SELECT relative_path,MAX(byte_offset+payload_size) AS end FROM segments WHERE payload_size>0 GROUP BY relative_path'):
-            path=self.recordings_root/item['relative_path']
-            if path.exists():
-                with path.open('r+b') as handle:handle.truncate(item['end'])
-        for p in self.recordings_root.glob('*/*.mp4'):
+        known=set()
+        for table in ('segments','browser_segments'):
+            for row in self.rows(f'SELECT * FROM {table}'):
+                path=self.archive_path(row)
+                if path.exists():known.add(path)
+                else:self.execute(f'DELETE FROM {table} WHERE id=?',(row['id'],))
+            # Ignore uncommitted tails independently in both archives after a crash.
+            for item in self.rows(f'SELECT relative_path,MAX(byte_offset+payload_size) AS end FROM {table} WHERE payload_size>0 GROUP BY relative_path'):
+                path=self.recordings_root/item['relative_path']
+                if path.exists():
+                    with path.open('r+b') as handle:handle.truncate(item['end'])
+        files=[*self.recordings_root.glob('*/*.mp4'),*self.recordings_root.glob('*/Browser/*.mp4')]
+        for p in files:
             if '_hour_' in p.name and p not in known:p.unlink(missing_ok=True)
             if re.fullmatch(r'\d{4}-\d{2}-\d{2}_.+_seg_\d+\.mp4',p.name) and p not in known:
                 p.unlink(missing_ok=True)
@@ -390,23 +417,26 @@ class Worker:
             path=self.folder/name
             if name in self.seen:continue
             camera=self.store.camera(self.camera['id'])
-            if self.preview_only or self.mode=='live' or not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
+            if (self.preview_only and self.codec!='h264') or self.mode=='live' or not camera or not camera['record_enabled'] or path.stat().st_mtime<=camera['record_since']:
                 self.archive_key=None
                 self.seen.add(name);continue
             if self.timing_source!='camera-rtcp':
                 self.warning='Waiting for camera RTCP capture timestamps. Live view works; recording waits for verified camera time.'
                 continue
+            table='browser_segments' if self.preview_only else 'segments'
             day=datetime.fromtimestamp(start,ZoneInfo(self.store.get('timezone')))
             key=day.strftime('%Y-%m-%d_%H%z')
             # One file per clock hour and connection session. Re-enabling also opens a new file.
             with self.store.lock:
                 if self.archive_key!=key or not self.archive_output or not self.archive_output.exists():
                     target=self.store.camera_folder(camera['id'])
+                    if self.preview_only:
+                        target=target/'Browser';target.mkdir(exist_ok=True)
                     filename=day.strftime('%Y-%m-%d_%H-%M-%S%z')+'_hour_'+self.session+'_'+uuid.uuid4().hex[:6]+'.mp4'
                     self.archive_output=target/filename
                     self.archive_key=key
                 output=self.archive_output
-                if self.store.rows('SELECT id FROM segments WHERE camera_id=? AND session=? AND name=?',(camera['id'],self.session,name)):
+                if self.store.rows(f'SELECT id FROM {table} WHERE camera_id=? AND session=? AND name=?',(camera['id'],self.session,name)):
                     self.seen.add(name);continue
                 previous_size=output.stat().st_size if output.exists() else 0
                 try:
@@ -417,7 +447,7 @@ class Worker:
                         handle.write(fragment)
                         handle.flush();os.fsync(handle.fileno())
                     relative=output.relative_to(self.store.recordings_root).as_posix()
-                    self.store.execute('INSERT OR IGNORE INTO segments(camera_id,session,name,start,duration,size,relative_path,init_size,timing_source,byte_offset,payload_size) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                    self.store.execute(f'INSERT OR IGNORE INTO {table}(camera_id,session,name,start,duration,size,relative_path,init_size,timing_source,byte_offset,payload_size) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                         (camera['id'],self.session,name,start,duration,len(fragment)+(len(init) if offset==len(init) else 0),relative,len(init),'camera-rtcp',offset,len(fragment)))
                 except Exception:
                     # Roll back partial appends if disk writes or the index commit fail.
@@ -429,7 +459,7 @@ class Worker:
         entries=calibrated
         # Keep memory bounded during long-running camera sessions.
         self.seen.intersection_update({e[0] for e in entries})
-        native=self.sync_native_preview()
+        native=False if getattr(self,'finishing',False) else self.sync_native_preview()
         if not native and self.mode!='storage' and self.camera['compatible'] and entries and self.transcoder is None:
             target = self.folder / 'compatible'
             target.mkdir(exist_ok=True)
@@ -457,10 +487,16 @@ class Worker:
             self.warning = 'Compatible live conversion restarted. Original recording is unaffected.'
 
     def sync_native_preview(self):
-        if self.preview_only or not self.camera['compatible'] or self.mode=='storage':return False
+        if self.preview_only:return False
+        current=self.store.camera(self.camera['id'])
+        recording=bool(current and current['record_enabled'] and self.mode!='live')
+        viewing=bool(self.camera['compatible'] and self.mode!='storage')
+        if not recording and not viewing:
+            if self.preview_worker is not None:self.preview_worker.stop();self.preview_worker=None
+            return False
         camera=native_preview_camera(self.camera)
         if camera is None:return False
-        if self.realtime_ready and time.time()>self.hls_demand_until:
+        if not recording and self.realtime_ready and time.time()>self.hls_demand_until:
             if self.preview_worker is not None:self.preview_worker.stop();self.preview_worker=None
             return True
         worker=self.preview_worker
@@ -494,12 +530,14 @@ class Worker:
             pass
 
     def ingest_final(self):
+        self.finishing=True
         compatible = self.camera['compatible']
         self.camera['compatible'] = 0
         try:
             self.ingest()
         finally:
             self.camera['compatible'] = compatible
+            self.finishing=False
 
     def status(self):
         preview=self.preview_worker.status() if self.preview_worker is not None else None
